@@ -21,22 +21,19 @@ def full_content(link, output_dir):
 
         # Fetch the article content
         response = requests.get(url)
-        if response.status_code == 200:
-            # Parse the HTML content of the article
-            soup = BeautifulSoup(response.content, 'html.parser')
+        # Parse the HTML content of the article
+        soup = BeautifulSoup(response.content, 'html.parser')
 
-            # Extract the article HTML
-            article_html = str(soup)
+        # Extract the article HTML
+        article_html = str(soup)
 
-            # Save the article to a file
-            filename = os.path.join(output_dir, f"{title}.html")
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(f"URL: {url}\n\n")
-                f.write(article_html)
+        # Save the article to a file
+        filename = os.path.join(output_dir, f"{title}.html")
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"URL: {url}\n\n")
+            f.write(article_html)
 
             print(f"Article '{title}' saved to '{filename}'")
-        else:
-            print(f"Failed to fetch article '{title}' from '{url}'")
 
 def minimum_content(link, output_dir):
     # Parse the RSS feed
@@ -52,23 +49,21 @@ def minimum_content(link, output_dir):
 
         # Fetch the article content
         response = requests.get(url)
-        if response.status_code == 200:
-            # Parse the HTML content of the article
-            feedContent = entry.content
 
-            # Extract the article HTML
-            article_html = str(feedContent)
+        # Parse the HTML content of the article
+        feedContent = entry.content
 
-            # Save the article to a file
-            shortitle = title[:25]
-            filename = os.path.join(output_dir, f"{title}.html")
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(f"URL: {url}\r")
-                f.write(article_html)
+        # Extract the article HTML
+        article_html = str(feedContent)
+
+        # Save the article to a file
+        shortitle = title[:25]
+        filename = os.path.join(output_dir, f"{title}.html")
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"URL: {url}\r")
+            f.write(article_html)
 
             print(f"Article '{title}' saved to '{filename}'")
-        else:
-            print(f"Failed to fetch article '{title}' from '{url}'")
 
 def main():
     parser = argparse.ArgumentParser(description='An RSS feed article downloader.')
