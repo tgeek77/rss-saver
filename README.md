@@ -1,6 +1,6 @@
 # What is RSS Saver?
 
-RSS Saver saves an rss feed from an blog, podcast, a youtube feed, newspaper, etc. as a local html file. This html can be the full html of the page where of the article or it can be stripped down version of the article. You can then use Linux/Unix tools like `grep` to search those files quickly and easily.
+RSS Saver saves an rss feed from an blog, podcast, a youtube feed, newspaper, etc. as a local html file. This html can be the full html of the page where of the article or it can be stripped down "simple" version of the article. You can then use Linux/Unix tools like `grep` to search those files quickly and easily.
 
 # How do I use it?
 
@@ -17,6 +17,10 @@ options:
   --output OUTPUT, -o OUTPUT    Where should the articles be saved?
   --type TYPE, -t TYPE          Do you want "full" or "simple" articles?
 ```
+
+### About Simple Output
+
+The "simple" output only works with RSS feeds that are properly formatted with "content" tags. It looks like around 50% of the time, feeds do not have those tags and therefore that option is not available. If you're trying to download articles with "simple" and they aren't working, change to the "full" option instead.
 
 # Advanced Usage
 
