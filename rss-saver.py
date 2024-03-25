@@ -30,7 +30,7 @@ def full_content(link, output_dir):
 
         # Save the article to a file
         title_processed = re.sub(r'[^a-zA-Z]', '', title)
-        filename = os.path.join(output_dir, f"{title}.html")
+        filename = os.path.join(output_dir, f"{title_processed}.html")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\n\n")
             f.write(article_html)
@@ -60,7 +60,7 @@ def minimum_content(link, output_dir):
 
         # Save the article to a file
         title_processed = re.sub(r'[^a-zA-Z]', '', title)
-        filename = os.path.join(output_dir, f"{title}.html")
+        filename = os.path.join(output_dir, f"{title_processed}.html")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\n\n")
             f.write(article_html)
