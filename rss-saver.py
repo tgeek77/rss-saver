@@ -28,7 +28,7 @@ def full_content(link, output_dir):
         article_html = str(soup)
 
         # Save the article to a file
-        filename = os.path.join(output_dir, f"{title}.html")
+        filename = os.path.join(output_dir, f"\'{title}\'.html")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\n\n")
             f.write(article_html)
