@@ -29,8 +29,8 @@ def full_content(link, output_dir):
         article_html = str(soup)
 
         # Save the article to a file
-        filename_unprocessed = os.path.join(output_dir, f"{title}.html")
-        filename = re.sub(r'[^a-zA-Z]', '', filename_unprocessed)
+        title_processed = re.sub(r'[^a-zA-Z]', '', title)
+        filename = os.path.join(output_dir, f"{title}.html")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\n\n")
             f.write(article_html)
@@ -59,11 +59,10 @@ def minimum_content(link, output_dir):
         article_html = str(feedContent)
 
         # Save the article to a file
-        shortitle = title[:25]
-        filename_unprocessed = os.path.join(output_dir, f"{title}.html")
-        filename = re.sub(r'[^a-zA-Z]', '', filename_unprocessed)
+        title_processed = re.sub(r'[^a-zA-Z]', '', title)
+        filename = os.path.join(output_dir, f"{title}.html")
         with open(filename, "w", encoding="utf-8") as f:
-            f.write(f"URL: {url}\r")
+            f.write(f"URL: {url}\n\n")
             f.write(article_html)
 
             print(f"Article '{title}' saved to '{filename}'")
