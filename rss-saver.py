@@ -28,7 +28,8 @@ def full_content(link, output_dir):
         article_html = str(soup)
 
         # Save the article to a file
-        filename = os.path.join(output_dir, f"\'{title}\'.html")
+        filename_unprocessed = os.path.join(output_dir, f"{title}.html")
+        filename = = ''.join(char for char in filename_unprocessed if char not in string.punctuation)
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\n\n")
             f.write(article_html)
@@ -58,7 +59,8 @@ def minimum_content(link, output_dir):
 
         # Save the article to a file
         shortitle = title[:25]
-        filename = os.path.join(output_dir, f"\'{title}\'.html")
+        filename_unprocessed = os.path.join(output_dir, f"{title}.html")
+        filename = = ''.join(char for char in filename_unprocessed if char not in string.punctuation)
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\r")
             f.write(article_html)
