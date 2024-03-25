@@ -58,7 +58,7 @@ def minimum_content(link, output_dir):
 
         # Save the article to a file
         shortitle = title[:25]
-        filename = os.path.join(output_dir, f"{title}.html")
+        filename = os.path.join(output_dir, f"\'{title}\'.html")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"URL: {url}\r")
             f.write(article_html)
