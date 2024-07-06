@@ -4,7 +4,28 @@ RSS Saver saves an rss feed from an blog, podcast, a youtube feed, newspaper, et
 
 # How do I use it?
 
-The command line options for both scripts are the same:
+## Prerequisites and Installation
+
+RSS Saver is a python script that requires the addition of a few dependencies: BeautifulSoup4, feedparser, requests.
+
+You can install these dependencies with the following commands. If you are using Mac or Windows, you'll probably want to use WSL or research these on your own:
+
+* Debian, Ubuntu
+`apt install python3-bs4 python3-feedparser python3-requests` 
+
+* Arch
+`pacman -S python-beautifulsoup4 python-feedparser python-requests`
+
+* OpenSUSE
+`zypper in python3-feedparser python3-requests python3-beautifulsoup4`
+
+Once the prerequisites are installed, you can either save the script [directly](https://raw.githubusercontent.com/tgeek77/rss-saver/main/rss-saver.py) or download/clone this repository.
+
+Run `python3 rss-saver.py` to run the script with the options below.
+
+## Run RSS Saver
+
+The command line options for this script are below. The **url**, **output**, and the **type** are manditory.
 
 ```
 usage: rss-saver.py [-h] [--url URL] [--output OUTPUT] [--type TYPE]
@@ -14,7 +35,7 @@ An RSS feed article downloader.
 options:
   -h, --help                    show this help message and exit
   --url URL, -u URL             What is the URL of the RSS Feed?
-  --output OUTPUT, -o OUTPUT    Where should the articles be saved?
+  --output OUTPUT, -o OUTPUT    Which directory should the articles be saved into?
   --type TYPE, -t TYPE          Do you want "full" or "simple" articles?
 ```
 

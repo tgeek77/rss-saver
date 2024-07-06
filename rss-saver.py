@@ -72,7 +72,7 @@ def main():
 
     # Add the feed, output, and type arguments
     parser.add_argument('--url', '-u', help='What is the URL of the RSS Feed?')
-    parser.add_argument('--output', '-o', help='Where should the articles be saved?')
+    parser.add_argument('--output', '-o', help='Which directory should the articles be saved into?')
     parser.add_argument('--type', '-t', help='Do you want "full" or "simple" articles?')
 
     args = parser.parse_args()
