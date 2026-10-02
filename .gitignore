@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Env / secrets
+.env
+.env.*
+
+# Local download output
+feeds/
+output/
+downloads/
+.tmp-*/
+
+# Local subscription lists (keep resources/ tracked)
+my_rss_list
+my_feeds.opml

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>rss-saver test feeds</title>
+  </head>
+  <body>
+    <outline text="Test feeds" title="Test feeds">
+      <outline type="rss" text="Something Awful News" title="Something Awful News" xmlUrl="http://www.somethingawful.com/rss/news.rss.xml"/>
+      <outline type="rss" text="Kudika" title="Kudika" xmlUrl="http://www.kudika.ro/feed.xml"/>
+      <outline type="rss" text="El Colombiano Internacional" title="El Colombiano Internacional" xmlUrl="http://www.elcolombiano.com/rss/Internacional.xml"/>
+      <outline type="rss" text="Trouw Religie Filosofie" title="Trouw Religie Filosofie" xmlUrl="http://www.trouw.nl/religie-filosofie/rss.xml"/>
+      <outline type="rss" text="BBC Scotland Tayside" title="BBC Scotland Tayside" xmlUrl="https://feeds.bbci.co.uk/news/scotland/tayside_and_central/rss.xml"/>
+    </outline>
+  </body>
+</opml>
