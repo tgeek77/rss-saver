@@ -539,7 +539,7 @@ class Store:
             JOIN items i ON i.id = r.item_id
             JOIN feeds f ON f.id = i.feed_id
             WHERE r.downloaded_at >= ?
-            ORDER BY r.downloaded_at DESC
+            ORDER BY COALESCE(r.published_at, r.downloaded_at) DESC
             """,
             (since,),
         ).fetchall()

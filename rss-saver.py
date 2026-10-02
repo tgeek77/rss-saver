@@ -1200,7 +1200,7 @@ def cmd_new(args, store):
         )
         print_table(
             info["rows"],
-            ["downloaded_at", "rev", "title", "item_uuid", "revision_uuid", "frozen"],
+            ["published_at", "rev", "title", "item_uuid", "revision_uuid", "frozen"],
         )
         print()
 

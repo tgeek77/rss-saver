@@ -107,11 +107,12 @@ def run_tui(store):
             rows = self.store.list_new(since)
             self._rows = rows
             table = self._clear_table(
-                ["when", "feed", "title", "rev", "item", "frozen"]
+                ["published", "feed", "title", "rev", "item", "frozen"]
             )
             for r in rows:
+                when = r.get("published_at") or r.get("downloaded_at") or ""
                 table.add_row(
-                    (r.get("downloaded_at") or "")[:19],
+                    when[:19],
                     (r.get("feed_title") or "")[:24],
                     (r.get("title") or "")[:48],
                     str(r.get("rev")),
