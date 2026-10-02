@@ -1,8 +1,18 @@
 # What is RSS Saver?
 
+**Version 2.0**
+
 RSS Saver saves an RSS or Atom feed from a blog, podcast, YouTube feed, newspaper, etc. as local HTML files and optional full-page screenshots. You can then use Linux/Unix tools like `grep` to search those files quickly and easily.
 
 It also accepts **OPML** subscription lists, downloading every listed feed into its own directory with a Markdown index of what was saved.
+
+## What's new in 2.0
+
+- **OPML** input (`--opml` / `-p`) for batch-saving many feeds
+- Per-feed output directories with an **`INDEX.md`** (published/downloaded dates, screenshot names, article URLs)
+- **`--checkup`** to skip articles already listed in `INDEX.md`
+- Optional **full-page screenshots** via Chrome, Brave, Chromium, or auto-installed `chrome-headless-shell`
+- Offline-friendly HTML: absolute URLs, inlined stylesheets, source URL at the bottom of each page
 
 # How do I use it?
 
@@ -23,24 +33,24 @@ You can install these dependencies with the following commands. If you are using
 
 ### Screenshots (optional)
 
-Screenshots use a Chromium-family browser if one is available. HTML saving works without it.
+HTML saving works without a browser. Screenshots use this both/and policy:
 
-Detection order:
+1. **Prefer an installed Chrome-based browser** if found: Google Chrome, Brave, or Chromium  
+   (`RSS_SAVER_BROWSER` / `CHROME_BIN` override, then `PATH`, then macOS `/Applications` paths).
+2. **Otherwise**, if this OS/arch supports Google’s `chrome-headless-shell`  
+   (Linux x86_64/ARM64, macOS Intel/Apple Silicon, Windows), **download and cache** it under  
+   `~/.cache/rss-saver/chrome-headless-shell/` and use that.
+3. **Otherwise** (e.g. OpenBSD with no Chromium installed): print a warning that screenshots  
+   are unavailable until a Chrome-based browser is installed. HTML still saves.
 
-1. `RSS_SAVER_BROWSER` or `CHROME_BIN` (path to an executable)
-2. On `PATH`: `chrome-headless-shell`, `chromium`, `chromium-browser`, `google-chrome`, `google-chrome-stable`, `chrome`
-3. macOS app bundles under `/Applications/` when present
+Install examples when you want a system browser (or when headless-shell isn’t available):
 
-Linux and macOS are the primary documented platforms. Any OS works the same if Chromium is installed and on `PATH` (for example OpenBSD after `pkg_add chromium`).
-
-Install examples when screenshots are unavailable:
-
-* Arch: `sudo pacman -S chromium`
+* Arch: `sudo pacman -S chromium` (or install Brave / Google Chrome)
 * Debian/Ubuntu: `sudo apt install chromium`
-* macOS: `brew install --cask chromium`
+* macOS: `brew install --cask chromium` (or Chrome / Brave)
 * OpenBSD: `doas pkg_add chromium`
 
-You can also put Google’s `chrome-headless-shell` on your `PATH`, or set `RSS_SAVER_BROWSER=/path/to/chromium`.
+Or set `RSS_SAVER_BROWSER=/path/to/chrome-or-chromium`.
 
 Once the Python prerequisites are installed, you can either save the script [directly](https://raw.githubusercontent.com/tgeek77/rss-saver/main/rss-saver.py) or download/clone this repository.
 
@@ -69,10 +79,10 @@ options:
 
 | Type | HTML | Screenshot |
 |------|------|------------|
-| `full` | Always | When Chromium is found |
-| `simple` | No | When Chromium is found (required) |
+| `full` | Always | When a Chrome-based browser (or headless-shell) is available |
+| `simple` | No | When a Chrome-based browser (or headless-shell) is available (required) |
 
-If no browser is found: `full` still saves HTML and prints an install hint; `simple` prints the hint and does nothing (does not crash).
+If no browser is available: `full` still saves HTML and prints an install hint; `simple` prints the hint and does nothing (does not crash).
 
 ### Single feed
 
@@ -123,7 +133,7 @@ Each feed gets its own subdirectory under `--output`, named from the feed title 
 - Article count
 - Table of file name, title, published date (from the feed), downloaded date, screenshot filename, and article URL
 
-Each `.html` file also starts with a `URL: ...` line for easy grepping.
+Each `.html` file ends with a visible `URL: ...` line at the bottom of the page (valid HTML, so formatting stays intact). Linked site stylesheets are inlined so `file://` viewing keeps the theme.
 
 # Advanced Usage
 

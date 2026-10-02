@@ -1,9 +1,11 @@
 #!/usr/bin/python3
+"""RSS Saver — download RSS/Atom/OPML feeds as local HTML (+ optional screenshots). Version 2.0."""
 
 import argparse
 import base64
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -12,8 +14,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from io import BytesIO
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -21,20 +25,143 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
-BROWSER_CANDIDATES = (
-    "chrome-headless-shell",
-    "chromium",
-    "chromium-browser",
+# Installed Chrome-based browsers (preferred over chrome-headless-shell).
+SYSTEM_BROWSER_CANDIDATES = (
     "google-chrome",
     "google-chrome-stable",
     "chrome",
+    "brave-browser",
+    "brave",
+    "chromium",
+    "chromium-browser",
 )
 
 MAC_BROWSER_PATHS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
 )
+
+CFT_DOWNLOADS_JSON = (
+    "https://googlechromelabs.github.io/chrome-for-testing/"
+    "last-known-good-versions-with-downloads.json"
+)
+
+# Desktop faux display for screenshots (match a real browser window; full-page height scrolls).
+# ~1024 collapses many sites' sidebars; 1920x1080 matches typical FireShot desktop captures.
+SCREENSHOT_WIDTH = 1920
+SCREENSHOT_HEIGHT = 1080
+
+# Light-touch offline CSS: do not override site layout/theme, only tame runaway media.
+OFFLINE_HTML_CSS = """
+/* rss-saver offline media safeguards (keep site CSS otherwise intact) */
+img, picture img, video, svg, canvas, iframe, object, embed {
+  max-width: 100% !important;
+  height: auto !important;
+}
+img[src^="data:"] {
+  max-width: 100% !important;
+  max-height: 90vh !important;
+  width: auto !important;
+  object-fit: contain !important;
+}
+pre, table {
+  max-width: 100% !important;
+  overflow-x: auto !important;
+}
+"""
+
+URL_ATTRS = (
+    "href",
+    "src",
+    "action",
+    "poster",
+    "data",
+    "cite",
+    "formaction",
+    "icon",
+    "manifest",
+    "background",
+)
+
+
+def absolutize_url(base_url, value):
+    """Turn a URL-like attribute value into an absolute URL when possible."""
+    if not value or not isinstance(value, str):
+        return value
+    value = value.strip()
+    if not value:
+        return value
+    lower = value.lower()
+    if lower.startswith(
+        ("data:", "javascript:", "mailto:", "tel:", "blob:", "#", "about:")
+    ):
+        return value
+    return urljoin(base_url, value)
+
+
+def absolutize_srcset(base_url, value):
+    """Rewrite each candidate URL in a srcset attribute."""
+    if not value or not isinstance(value, str):
+        return value
+    parts = []
+    for candidate in value.split(","):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        bits = candidate.split()
+        bits[0] = absolutize_url(base_url, bits[0])
+        parts.append(" ".join(bits))
+    return ", ".join(parts)
+
+
+def absolutize_css_urls(base_url, css_text):
+    """Rewrite url(...) references inside CSS text."""
+    if not css_text:
+        return css_text
+
+    def repl(match):
+        quote = match.group(1) or ""
+        raw = match.group(2).strip().strip("'\"")
+        abs_url = absolutize_url(base_url, raw)
+        return f"url({quote}{abs_url}{quote})"
+
+    return re.sub(
+        r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)",
+        repl,
+        css_text,
+        flags=re.IGNORECASE,
+    )
+
+
+def make_urls_absolute(soup, page_url):
+    """Rewrite root-relative and relative URLs so file:// viewing still loads assets."""
+    base_url = page_url
+    base_tag = soup.find("base", href=True)
+    if base_tag and base_tag.get("href"):
+        base_url = urljoin(page_url, base_tag["href"])
+
+    for tag in soup.find_all(True):
+        for attr in URL_ATTRS:
+            if tag.has_attr(attr):
+                tag[attr] = absolutize_url(base_url, tag.get(attr))
+        if tag.has_attr("srcset"):
+            tag["srcset"] = absolutize_srcset(base_url, tag.get("srcset"))
+        if tag.has_attr("style"):
+            tag["style"] = absolutize_css_urls(base_url, tag.get("style"))
+
+    for style in soup.find_all("style"):
+        if style.string:
+            style.string = absolutize_css_urls(base_url, str(style.string))
+
+    # Prefer a single absolute <base> so any remaining relatives resolve correctly.
+    for old_base in soup.find_all("base"):
+        old_base.decompose()
+    if soup.head:
+        base = soup.new_tag("base", href=page_url)
+        soup.head.insert(0, base)
+
+    return soup
 
 
 def slugify(text, fallback="untitled"):
@@ -59,13 +186,13 @@ def article_basename(title):
 
 
 def find_browser():
-    """Return a Chromium-family binary path, or None if not found."""
+    """Return an installed Chrome/Brave/Chromium binary, or None."""
     for env_name in ("RSS_SAVER_BROWSER", "CHROME_BIN"):
         override = os.environ.get(env_name)
         if override and os.path.isfile(override) and os.access(override, os.X_OK):
             return override
 
-    for name in BROWSER_CANDIDATES:
+    for name in SYSTEM_BROWSER_CANDIDATES:
         path = shutil.which(name)
         if path:
             return path
@@ -77,16 +204,179 @@ def find_browser():
     return None
 
 
+def cft_platform():
+    """
+    Map this machine to a Chrome for Testing platform id, or None if unsupported.
+    Supported: linux64, linux-arm64, mac-x64, mac-arm64, win32, win64.
+    """
+    system = platform.system()
+    machine = platform.machine().lower()
+
+    if system == "Linux":
+        if machine in ("aarch64", "arm64"):
+            return "linux-arm64"
+        if machine in ("x86_64", "amd64"):
+            return "linux64"
+        return None
+    if system == "Darwin":
+        if machine in ("arm64", "aarch64"):
+            return "mac-arm64"
+        return "mac-x64"
+    if system == "Windows":
+        if machine in ("amd64", "x86_64"):
+            return "win64"
+        return "win32"
+    return None
+
+
+def headless_shell_supported():
+    return cft_platform() is not None
+
+
+def rss_saver_cache_dir():
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return os.path.join(xdg, "rss-saver")
+    return os.path.join(os.path.expanduser("~"), ".cache", "rss-saver")
+
+
+def find_headless_shell():
+    """Find chrome-headless-shell on PATH or in the rss-saver cache."""
+    path = shutil.which("chrome-headless-shell")
+    if path:
+        return path
+
+    cache_root = os.path.join(rss_saver_cache_dir(), "chrome-headless-shell")
+    if not os.path.isdir(cache_root):
+        return None
+    for root, _dirs, files in os.walk(cache_root):
+        for name in files:
+            if name in ("chrome-headless-shell", "chrome-headless-shell.exe"):
+                candidate = os.path.join(root, name)
+                if os.access(candidate, os.X_OK) or name.endswith(".exe"):
+                    return candidate
+    return None
+
+
+def install_chrome_headless_shell():
+    """
+    Download Stable chrome-headless-shell for this platform into the cache.
+    Returns the binary path, or raises on failure.
+    """
+    plat = cft_platform()
+    if not plat:
+        raise RuntimeError("chrome-headless-shell is not available for this OS/arch")
+
+    print(
+        f"No Chrome/Brave/Chromium found; downloading chrome-headless-shell ({plat})...",
+        file=sys.stderr,
+    )
+    response = requests.get(CFT_DOWNLOADS_JSON, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    downloads = (
+        data.get("channels", {})
+        .get("Stable", {})
+        .get("downloads", {})
+        .get("chrome-headless-shell", [])
+    )
+    url = None
+    version = data.get("channels", {}).get("Stable", {}).get("version", "unknown")
+    for item in downloads:
+        if item.get("platform") == plat:
+            url = item.get("url")
+            break
+    if not url:
+        raise RuntimeError(
+            f"No chrome-headless-shell download listed for platform {plat}"
+        )
+
+    dest_dir = os.path.join(rss_saver_cache_dir(), "chrome-headless-shell", version, plat)
+    os.makedirs(dest_dir, exist_ok=True)
+    binary_name = (
+        "chrome-headless-shell.exe" if plat.startswith("win") else "chrome-headless-shell"
+    )
+    existing = None
+    for root, _dirs, files in os.walk(dest_dir):
+        if binary_name in files:
+            existing = os.path.join(root, binary_name)
+            break
+    if existing and (os.access(existing, os.X_OK) or existing.endswith(".exe")):
+        print(f"Using cached chrome-headless-shell: {existing}")
+        return existing
+
+    print(f"Fetching {url}", file=sys.stderr)
+    zip_resp = requests.get(url, timeout=300)
+    zip_resp.raise_for_status()
+    with zipfile.ZipFile(BytesIO(zip_resp.content)) as zf:
+        zf.extractall(dest_dir)
+
+    binary_path = None
+    for root, _dirs, files in os.walk(dest_dir):
+        if binary_name in files:
+            binary_path = os.path.join(root, binary_name)
+            break
+    if not binary_path:
+        raise RuntimeError(f"chrome-headless-shell binary missing after extract in {dest_dir}")
+
+    if not binary_path.endswith(".exe"):
+        os.chmod(
+            binary_path,
+            os.stat(binary_path).st_mode | 0o111,
+        )
+    print(f"Installed chrome-headless-shell to {binary_path}")
+    return binary_path
+
+
+def resolve_browser_for_screenshots():
+    """
+    1) Use installed Chrome / Brave / Chromium if present.
+    2) Else use chrome-headless-shell (PATH/cache), installing it when supported.
+    3) Else return None (screenshots unavailable).
+    """
+    browser = find_browser()
+    if browser:
+        return browser
+
+    shell = find_headless_shell()
+    if shell:
+        return shell
+
+    if headless_shell_supported():
+        try:
+            return install_chrome_headless_shell()
+        except Exception as exc:
+            print(
+                f"Failed to install chrome-headless-shell: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+    return None
+
+
 def screenshot_unavailable_hint():
+    if headless_shell_supported():
+        return (
+            "Screenshots unavailable: no Chrome/Brave/Chromium found, and "
+            "chrome-headless-shell could not be installed automatically.\n"
+            "Install a Chrome-based browser, e.g.:\n"
+            "  Arch:     sudo pacman -S chromium\n"
+            "  Debian:   sudo apt install chromium\n"
+            "  macOS:    brew install --cask chromium\n"
+            "  Or Brave / Google Chrome\n"
+            "Or set RSS_SAVER_BROWSER=/path/to/chrome-or-chromium"
+        )
     return (
-        "Screenshots unavailable: no chrome-headless-shell or Chrome/Chromium found.\n"
-        "Install Chromium to enable screenshots, e.g.:\n"
+        "Screenshots unavailable: no Chrome/Brave/Chromium found, and "
+        "chrome-headless-shell is not available for this OS/architecture.\n"
+        "Install a Chrome-based browser to enable screenshots, e.g.:\n"
         "  Arch:     sudo pacman -S chromium\n"
         "  Debian:   sudo apt install chromium\n"
         "  macOS:    brew install --cask chromium\n"
         "  OpenBSD:  doas pkg_add chromium\n"
-        "Or set RSS_SAVER_BROWSER=/path/to/chromium\n"
-        "Or put chrome-headless-shell on your PATH."
+        "  Or Brave / Google Chrome\n"
+        "Or set RSS_SAVER_BROWSER=/path/to/chrome-or-chromium"
     )
 
 
@@ -219,10 +509,72 @@ def load_index(feed_dir):
     return articles
 
 
+def inline_remote_stylesheets(soup, timeout=30):
+    """
+    Fetch linked stylesheets and embed them so file:// viewing keeps the site theme.
+    Leaves font provider links (e.g. fonts.googleapis.com) as remote links.
+    """
+    for link in list(soup.find_all("link", href=True)):
+        rel = " ".join(link.get("rel") or []).lower()
+        href = link.get("href") or ""
+        if "stylesheet" not in rel and ".css" not in href.split("?", 1)[0].lower():
+            continue
+        if "fonts.googleapis.com" in href or "fonts.gstatic.com" in href:
+            continue
+        if not href.startswith(("http://", "https://")):
+            continue
+        try:
+            response = requests.get(href, timeout=timeout)
+            response.raise_for_status()
+            css_text = absolutize_css_urls(href, response.text)
+            style = soup.new_tag("style", attrs={"data-rss-saver-href": href})
+            style.string = css_text
+            link.replace_with(style)
+        except requests.RequestException as exc:
+            print(
+                f"Warning: could not inline stylesheet {href}: {exc}",
+                file=sys.stderr,
+            )
+
+
 def fetch_full_html(url):
     response = requests.get(url, timeout=60)
     response.raise_for_status()
+    # Prefer the final URL after redirects as the absolutization base.
+    page_url = response.url or url
     soup = BeautifulSoup(response.content, "html.parser")
+    make_urls_absolute(soup, page_url)
+    inline_remote_stylesheets(soup)
+
+    # Ensure a sensible viewport for local viewing.
+    viewport = soup.find("meta", attrs={"name": "viewport"})
+    if viewport is None:
+        viewport = soup.new_tag("meta", attrs={"name": "viewport"})
+        if soup.head:
+            soup.head.insert(0, viewport)
+    viewport["content"] = "width=device-width, initial-scale=1"
+
+    # Light media safeguards; do not override the site's layout/theme.
+    style = soup.new_tag("style", attrs={"id": "rss-saver-offline"})
+    style.string = OFFLINE_HTML_CSS
+    if soup.head:
+        soup.head.append(style)
+    elif soup.html:
+        head = soup.new_tag("head")
+        head.append(style)
+        soup.html.insert(0, head)
+    else:
+        soup.insert(0, style)
+
+    # Visible, greppable source URL at end of page (valid HTML, does not break layout).
+    url_line = soup.new_tag("p", attrs={"id": "rss-saver-source-url"})
+    url_line.string = f"URL: {page_url}"
+    if soup.body:
+        soup.body.append(url_line)
+    elif soup.html:
+        soup.html.append(url_line)
+    else:
+        soup.append(url_line)
     return str(soup)
 
 
@@ -350,6 +702,7 @@ class ChromiumSession:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-dev-shm-usage",
+            f"--window-size={SCREENSHOT_WIDTH},{SCREENSHOT_HEIGHT}",
             f"--user-data-dir={self.profile_dir}",
             f"--crash-dumps-dir={os.path.join(self.profile_dir, 'crashes')}",
             "--remote-debugging-port=0",
@@ -432,13 +785,29 @@ class ChromiumSession:
             self._cdp(ws, "Page.enable")
             self._cdp(
                 ws,
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": SCREENSHOT_WIDTH,
+                    "height": SCREENSHOT_HEIGHT,
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                    "screenWidth": SCREENSHOT_WIDTH,
+                    "screenHeight": SCREENSHOT_HEIGHT,
+                },
+            )
+            try:
+                self._cdp(ws, "Emulation.setScrollbarsHidden", {"hidden": True})
+            except RuntimeError:
+                pass
+            self._cdp(
+                ws,
                 "Page.navigate",
                 {"url": url},
                 wait_event="Page.loadEventFired",
                 event_timeout=self.timeout,
             )
-            # Brief settle for late layout / lazy content
-            time.sleep(0.5)
+            # Brief settle for late layout / lazy content / responsive CSS
+            time.sleep(1.0)
             result = self._cdp(
                 ws,
                 "Page.captureScreenshot",
@@ -521,7 +890,6 @@ def save_feed(feed_url, output_root, mode, preferred_title=None, checkup=False, 
                 print(f"Failed to fetch '{title}' ({url}): {exc}", file=sys.stderr)
                 continue
             with open(html_path, "w", encoding="utf-8") as f:
-                f.write(f"URL: {url}\n\n")
                 f.write(article_html)
             html_saved = html_name
             print(f"Article '{title}' saved to '{html_path}'")
@@ -595,7 +963,7 @@ def main():
     if bool(args.url) == bool(args.opml):
         parser.error("Specify exactly one of --url/-u or --opml/-p")
 
-    browser_path = find_browser()
+    browser_path = resolve_browser_for_screenshots()
     browser_session = None
     try:
         if browser_path:
@@ -615,7 +983,7 @@ def main():
 
         if args.type == "simple" and browser_session is None:
             print(
-                "simple mode requires Chromium for screenshots; nothing to do.",
+                "simple mode requires a Chrome-based browser for screenshots; nothing to do.",
                 file=sys.stderr,
             )
             return

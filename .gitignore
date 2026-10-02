@@ -26,6 +26,7 @@ env/
 feeds/
 output/
 downloads/
+.tmp-*/
 
 # Local subscription lists (keep resources/ tracked)
 my_rss_list
