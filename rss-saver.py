@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""RSS Saver — download RSS/Atom/OPML feeds as local HTML (+ optional screenshots). Version 2.0."""
+"""RSS Saver — download RSS/Atom/OPML feeds into SQLite (+ optional screenshots/files). Version 2.1."""
 
 import argparse
 import base64
@@ -13,9 +13,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -25,6 +28,13 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
+from rss_saver_db import (
+    Store,
+    content_hash_bytes,
+    content_hash_text,
+    default_db_path,
+    parse_since,
+)
 # Installed Chrome-based browsers (preferred over chrome-headless-shell).
 SYSTEM_BROWSER_CANDIDATES = (
     "google-chrome",
@@ -779,7 +789,8 @@ class ChromiumSession:
                     return result
         raise TimeoutError(f"CDP timeout on {method}" + (f" / {wait_event}" if wait_event else ""))
 
-    def capture_screenshot(self, url, dest_png):
+    def capture_screenshot_bytes(self, url):
+        """Navigate and return full-page PNG bytes."""
         ws = _WebSocketClient(self._ws_url_for_page(), timeout=self.timeout)
         try:
             self._cdp(ws, "Page.enable")
@@ -806,7 +817,6 @@ class ChromiumSession:
                 wait_event="Page.loadEventFired",
                 event_timeout=self.timeout,
             )
-            # Brief settle for late layout / lazy content / responsive CSS
             time.sleep(1.0)
             result = self._cdp(
                 ws,
@@ -820,11 +830,15 @@ class ChromiumSession:
             data = result.get("data")
             if not data:
                 raise RuntimeError("Page.captureScreenshot returned no data")
-            with open(dest_png, "wb") as f:
-                f.write(base64.b64decode(data))
+            return base64.b64decode(data)
         finally:
             ws.close()
 
+    def capture_screenshot(self, url, dest_png):
+        png = self.capture_screenshot_bytes(url)
+        with open(dest_png, "wb") as f:
+            f.write(png)
+        return png
     def close(self):
         if self.proc is not None:
             self.proc.terminate()
@@ -846,125 +860,248 @@ class ChromiumSession:
         return False
 
 
-def save_feed(feed_url, output_root, mode, preferred_title=None, checkup=False, browser_session=None):
-    feed = feedparser.parse(feed_url)
-    feed_title = preferred_title or feed.feed.get("title") or feed_url
-    feed_dir = os.path.join(output_root, feed_dir_name(feed_title, feed_url))
-    os.makedirs(feed_dir, exist_ok=True)
+def html_to_text(html):
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(" ", strip=True)
+
+
+def print_table(rows, columns):
+    if not rows:
+        print("(none)")
+        return
+    widths = {c: len(c) for c in columns}
+    for row in rows:
+        for c in columns:
+            widths[c] = max(widths[c], len(str(row.get(c, "") if row.get(c) is not None else "")))
+    header = "  ".join(c.ljust(widths[c]) for c in columns)
+    print(header)
+    print("  ".join("-" * widths[c] for c in columns))
+    for row in rows:
+        print(
+            "  ".join(
+                str(row.get(c, "") if row.get(c) is not None else "").ljust(widths[c])
+                for c in columns
+            )
+        )
+
+
+def emit(data, as_json=False, columns=None):
+    if as_json:
+        print(json.dumps(data, indent=2, default=str))
+        return
+    if isinstance(data, list):
+        if not data:
+            print("(none)")
+            return
+        cols = columns or list(data[0].keys())
+        print_table(data, cols)
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            print(f"{k}: {v}")
+    else:
+        print(data)
+
+
+def pull_feed(
+    store,
+    feed_url,
+    mode,
+    preferred_title=None,
+    output_root=None,
+    download_files=False,
+    force=False,
+    browser_session=None,
+    browser_lock=None,
+):
+    """
+    Delta pull one feed into SQLite. Optionally dual-write files with --dl.
+    Returns dict with counts.
+    """
+    feed_row = store.upsert_feed(feed_url, preferred_title or "")
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        store.touch_feed(feed_row["id"], error=str(exc))
+        print(f"Failed to parse feed {feed_url}: {exc}", file=sys.stderr)
+        return {"feed": feed_url, "new": 0, "skipped": 0, "errors": 1}
+
+    feed_title = preferred_title or parsed.feed.get("title") or feed_url
+    store.upsert_feed(feed_url, feed_title)
+    feed_row = store.get_feed(feed_url)
 
     if mode == "simple" and browser_session is None:
         print(
-            f"Skipping feed '{feed_title}': simple mode needs Chromium for screenshots",
+            f"Skipping feed '{feed_title}': simple mode needs a browser for screenshots",
             file=sys.stderr,
         )
-        return []
+        store.touch_feed(feed_row["id"], error="simple mode requires browser")
+        return {"feed": feed_title, "new": 0, "skipped": 0, "errors": 1}
 
-    articles = load_index(feed_dir) if checkup else []
-    known_urls = {a["url"] for a in articles}
+    feed_dir = None
+    disk_articles = []
+    if download_files:
+        if not output_root:
+            raise ValueError("--dl requires --output")
+        feed_dir = os.path.join(output_root, feed_dir_name(feed_title, feed_url))
+        os.makedirs(feed_dir, exist_ok=True)
+        disk_articles = load_index(feed_dir)
+
     new_count = 0
     skipped = 0
+    errors = 0
 
-    for entry in feed.entries:
+    for entry in parsed.entries:
         title = getattr(entry, "title", None) or "untitled"
         url = getattr(entry, "link", None)
         if not url:
             print(f"Skipping entry without link in '{feed_title}'", file=sys.stderr)
             continue
 
-        if checkup and url in known_urls:
-            skipped += 1
-            continue
+        item = store.ensure_item(feed_row["id"], url)
 
-        base = article_basename(title)
-        html_name = f"{base}.html"
-        png_name = f"{base}.png"
-        html_path = os.path.join(feed_dir, html_name)
-        png_path = os.path.join(feed_dir, png_name)
-        screenshot_saved = ""
-        html_saved = ""
+        # Fast path: if not forcing and we already have any revision, we still
+        # must fetch to detect content changes — unless we only skip when we
+        # cannot/won't fetch. Plan: always fetch for delta hash compare unless
+        # we could skip without fetch... We need content to hash. So we fetch.
+        # Optimization: without --force, still fetch HTML to compare hash.
+
+        article_html = None
+        png_bytes = None
+        digest = None
 
         if mode == "full":
             try:
                 article_html = fetch_full_html(url)
             except requests.RequestException as exc:
                 print(f"Failed to fetch '{title}' ({url}): {exc}", file=sys.stderr)
+                errors += 1
                 continue
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(article_html)
-            html_saved = html_name
-            print(f"Article '{title}' saved to '{html_path}'")
+            digest = content_hash_text(article_html)
+            if not force and store.has_content_hash(item["id"], digest):
+                skipped += 1
+                continue
 
         if browser_session is not None:
             try:
-                browser_session.capture_screenshot(url, png_path)
-                screenshot_saved = png_name
-                print(f"Screenshot '{title}' saved to '{png_path}'")
+                lock = browser_lock or threading.Lock()
+                with lock:
+                    png_bytes = browser_session.capture_screenshot_bytes(url)
             except Exception as exc:
                 print(f"Screenshot failed for '{title}' ({url}): {exc}", file=sys.stderr)
                 if mode == "simple":
+                    errors += 1
                     continue
-        elif mode == "simple":
+            if mode == "simple":
+                if not png_bytes:
+                    errors += 1
+                    continue
+                digest = content_hash_bytes(png_bytes)
+                if not force and store.has_content_hash(item["id"], digest):
+                    skipped += 1
+                    continue
+
+        if not digest:
+            errors += 1
             continue
 
-        articles.append(
-            {
-                "file": html_saved,
-                "title": title,
-                "published": format_entry_date(entry),
-                "downloaded": utc_now(),
-                "screenshot": screenshot_saved,
-                "url": url,
-            }
+        if not force and store.has_content_hash(item["id"], digest):
+            skipped += 1
+            continue
+
+        # Determine next rev number for optional disk naming
+        existing = store.list_revisions(item["uuid"])
+        next_rev = (existing[0]["rev"] if existing else 0) + 1
+
+        html_path = None
+        png_path = None
+        html_name = ""
+        png_name = ""
+        if download_files and feed_dir:
+            base = article_basename(title)
+            if next_rev > 1:
+                base = f"{base}_r{next_rev}"
+            if article_html is not None:
+                html_name = f"{base}.html"
+                html_path_full = os.path.join(feed_dir, html_name)
+                with open(html_path_full, "w", encoding="utf-8") as f:
+                    f.write(article_html)
+                html_path = html_name
+                print(f"Article '{title}' saved to '{html_path_full}'")
+            if png_bytes is not None:
+                png_name = f"{base}.png"
+                png_path_full = os.path.join(feed_dir, png_name)
+                with open(png_path_full, "wb") as f:
+                    f.write(png_bytes)
+                png_path = png_name
+                print(f"Screenshot '{title}' saved to '{png_path_full}'")
+
+        rev = store.insert_revision(
+            item["id"],
+            content_hash=digest,
+            title=title,
+            published_at=format_entry_date(entry),
+            mode=mode,
+            html=article_html,
+            screenshot=png_bytes,
+            html_path=html_path,
+            screenshot_path=png_path,
+            body_text=html_to_text(article_html) if article_html else title,
         )
-        known_urls.add(url)
+        if rev is None:
+            skipped += 1
+            continue
+
         new_count += 1
-
-    write_index(feed_dir, feed_title, feed_url, mode, articles)
-    if checkup:
         print(
-            f"Checkup '{feed_title}': {new_count} new, {skipped} already in index "
-            f"({len(articles)} total) -> {os.path.join(feed_dir, 'INDEX.md')}"
+            f"Stored '{title}' item={item['uuid']} rev={rev['rev']} "
+            f"revision={rev['uuid']}"
         )
-    else:
-        print(
-            f"Wrote index for '{feed_title}': {new_count} saved "
-            f"({len(articles)} total) -> {os.path.join(feed_dir, 'INDEX.md')}"
-        )
-    return articles
+        if download_files:
+            disk_articles.append(
+                {
+                    "file": html_name,
+                    "title": title,
+                    "published": format_entry_date(entry),
+                    "downloaded": utc_now(),
+                    "screenshot": png_name,
+                    "url": url,
+                }
+            )
 
+    if download_files and feed_dir:
+        # Merge unique by URL keeping latest disk_articles entries last
+        by_url = {}
+        for a in load_index(feed_dir) + disk_articles:
+            by_url[a["url"]] = a
+        write_index(feed_dir, feed_title, feed_url, mode, list(by_url.values()))
 
-def main():
-    parser = argparse.ArgumentParser(description="An RSS/Atom/OPML feed article downloader.")
-    parser.add_argument("--url", "-u", help="URL of a single RSS/Atom feed")
-    parser.add_argument(
-        "--opml",
-        "-p",
-        help="Path or URL of an OPML file listing feeds to download",
+    store.touch_feed(feed_row["id"], error=None)
+    print(
+        f"Delta '{feed_title}': {new_count} new revision(s), {skipped} unchanged, "
+        f"{errors} error(s)"
     )
-    parser.add_argument("--output", "-o", help="Directory to save articles into")
-    parser.add_argument(
-        "--type",
-        "-t",
-        choices=["full", "simple"],
-        help='full: HTML + screenshot when Chromium is available; '
-        "simple: screenshot only (requires Chromium)",
-    )
-    parser.add_argument(
-        "--checkup",
-        "-c",
-        action="store_true",
-        help="Only download articles whose URLs are not already listed in INDEX.md",
-    )
+    return {
+        "feed": feed_title,
+        "feed_uuid": feed_row["uuid"],
+        "new": new_count,
+        "skipped": skipped,
+        "errors": errors,
+    }
 
-    args = parser.parse_args()
 
-    if not args.output or not args.type:
-        parser.error("Please specify --output/-o and --type/-t (full or simple)")
+def cmd_pull(args, store):
+    if not args.type:
+        raise SystemExit("pull requires --type/-t (full or simple)")
     if bool(args.url) == bool(args.opml):
-        parser.error("Specify exactly one of --url/-u or --opml/-p")
+        raise SystemExit("Specify exactly one of --url/-u or --opml/-p")
+    if args.dl and not args.output:
+        raise SystemExit("--dl requires --output/-o")
 
     browser_path = resolve_browser_for_screenshots()
     browser_session = None
+    browser_lock = threading.Lock()
     try:
         if browser_path:
             try:
@@ -982,37 +1119,513 @@ def main():
             print(screenshot_unavailable_hint(), file=sys.stderr)
 
         if args.type == "simple" and browser_session is None:
-            print(
-                "simple mode requires a Chrome-based browser for screenshots; nothing to do.",
-                file=sys.stderr,
-            )
-            return
-
-        def run_feed(feed_url, preferred_title=None):
-            save_feed(
-                feed_url,
-                args.output,
-                args.type,
-                preferred_title=preferred_title,
-                checkup=args.checkup,
-                browser_session=browser_session,
+            raise SystemExit(
+                "simple mode requires a Chrome-based browser for screenshots"
             )
 
         if args.opml:
             try:
                 feeds = parse_opml(args.opml)
             except (OSError, ElementTree.ParseError, requests.RequestException) as exc:
-                parser.error(f"Failed to read OPML: {exc}")
+                raise SystemExit(f"Failed to read OPML: {exc}") from exc
             if not feeds:
-                parser.error("No feeds with xmlUrl found in OPML")
-            print(f"Found {len(feeds)} feed(s) in OPML")
-            for item in feeds:
-                run_feed(item["url"], preferred_title=item["title"] or None)
+                raise SystemExit("No feeds with xmlUrl found in OPML")
+            print(f"Found {len(feeds)} feed(s) in OPML; jobs={args.jobs}")
         else:
-            run_feed(args.url)
+            feeds = [{"url": args.url, "title": ""}]
+
+        results = []
+
+        def work(item):
+            return pull_feed(
+                store,
+                item["url"],
+                args.type,
+                preferred_title=item.get("title") or None,
+                output_root=args.output,
+                download_files=args.dl,
+                force=args.force,
+                browser_session=browser_session,
+                browser_lock=browser_lock,
+            )
+
+        jobs = max(1, int(args.jobs))
+        if jobs == 1 or len(feeds) == 1:
+            for item in feeds:
+                results.append(work(item))
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                futs = {pool.submit(work, item): item for item in feeds}
+                for fut in as_completed(futs):
+                    try:
+                        results.append(fut.result())
+                    except Exception as exc:
+                        item = futs[fut]
+                        print(f"Feed worker failed for {item['url']}: {exc}", file=sys.stderr)
+                        results.append(
+                            {"feed": item["url"], "new": 0, "skipped": 0, "errors": 1}
+                        )
+
+        if args.gc:
+            removed = store.gc(dry_run=False)
+            print(f"GC removed {len(removed)} item(s)")
+
+        emit(results, as_json=args.json, columns=["feed", "new", "skipped", "errors"])
     finally:
         if browser_session is not None:
             browser_session.close()
+
+
+def cmd_new(args, store):
+    since = parse_since(args.since)
+    rows = store.list_new(since)
+    if args.json:
+        emit(rows, as_json=True)
+        return
+    # Group summary
+    feeds = {}
+    for r in rows:
+        key = r["feed_title"] or r["feed_url"]
+        feeds.setdefault(key, {"new_items": 0, "new_revisions": 0, "rows": []})
+        if r["rev_count"] == 1 and r["rev"] == 1:
+            feeds[key]["new_items"] += 1
+        else:
+            feeds[key]["new_revisions"] += 1
+        feeds[key]["rows"].append(r)
+    print(f"Since {since}: {len(rows)} revision(s) across {len(feeds)} feed(s)\n")
+    for feed_name, info in sorted(feeds.items()):
+        print(
+            f"## {feed_name}  (new items={info['new_items']}, "
+            f"new revisions of existing={info['new_revisions']})"
+        )
+        print_table(
+            info["rows"],
+            ["downloaded_at", "rev", "title", "item_uuid", "revision_uuid", "frozen"],
+        )
+        print()
+
+
+def cmd_feeds(args, store):
+    since = parse_since(args.updated_since) if args.updated_since else None
+    rows = [dict(r) for r in store.list_feeds(updated_since=since)]
+    emit(
+        rows,
+        as_json=args.json,
+        columns=[
+            "uuid",
+            "title",
+            "url",
+            "retention_days",
+            "last_fetched_at",
+            "item_count",
+            "new_revs",
+        ],
+    )
+
+
+def cmd_list(args, store):
+    since = parse_since(args.since) if args.since else None
+    until = parse_since(args.until) if args.until else None
+    rows = store.list_items(
+        feed=args.feed,
+        tag=args.tag,
+        since=since,
+        until=until,
+        url=args.url_filter,
+        limit=args.limit,
+        all_revisions=args.all_revisions,
+        sort=args.sort,
+    )
+    emit(
+        rows,
+        as_json=args.json,
+        columns=[
+            "downloaded_at",
+            "feed_title",
+            "title",
+            "rev",
+            "item_uuid",
+            "revision_uuid",
+            "frozen",
+        ],
+    )
+
+
+def cmd_search(args, store):
+    since = parse_since(args.since) if args.since else None
+    rows = store.search(
+        args.query,
+        feed=args.feed,
+        tag=args.tag,
+        since=since,
+        limit=args.limit,
+    )
+    emit(
+        rows,
+        as_json=args.json,
+        columns=["revision_uuid", "title", "feed_title", "snippet", "item_uuid"],
+    )
+
+
+def cmd_revisions(args, store):
+    rows = store.list_revisions(args.item)
+    emit(
+        rows,
+        as_json=args.json,
+        columns=["uuid", "rev", "downloaded_at", "title", "content_hash", "html_bytes", "png_bytes"],
+    )
+
+
+def cmd_show(args, store):
+    data = store.show_revision(args.revision)
+    if not data:
+        raise SystemExit(f"revision not found: {args.revision}")
+    if args.meta_only or not args.json:
+        slim = {k: v for k, v in data.items()}
+        emit(slim, as_json=args.json)
+    else:
+        emit(data, as_json=True)
+
+
+def cmd_export(args, store):
+    if args.revision:
+        keys = [args.revision]
+    elif args.since:
+        since = parse_since(args.since)
+        keys = [r["revision_uuid"] for r in store.list_new(since)]
+    else:
+        raise SystemExit("export requires REVISION or --since")
+    dest = args.output or tempfile.mkdtemp(prefix="rss-saver-export-")
+    written = []
+    for key in keys:
+        paths = store.export_revision(key, os.path.join(dest, key))
+        written.append({"revision": key, **paths})
+    emit(written, as_json=args.json)
+
+
+def cmd_tag(args, store):
+    if args.tag_action == "list":
+        rows = [dict(r) for r in store.list_tags(args.item)]
+        emit(rows, as_json=args.json, columns=["id", "name"])
+        return
+    if not args.item or not args.names:
+        raise SystemExit("tag add/rm requires ITEM and tag names")
+    if args.tag_action == "add":
+        applied = store.tag_item(args.item, args.names)
+        emit({"item": args.item, "tags": applied}, as_json=args.json)
+    else:
+        store.untag_item(args.item, args.names)
+        emit({"item": args.item, "removed": args.names}, as_json=args.json)
+
+
+def cmd_freeze(args, store):
+    item = store.set_frozen(args.item, True)
+    emit({"item_uuid": item["uuid"], "frozen": True}, as_json=args.json)
+
+
+def cmd_unfreeze(args, store):
+    item = store.set_frozen(args.item, False)
+    emit({"item_uuid": item["uuid"], "frozen": False}, as_json=args.json)
+
+
+def cmd_retention(args, store):
+    if args.retention_action == "set":
+        days = None if args.days in (None, 0, "0", "unlimited") else int(args.days)
+        feed = store.set_retention(args.feed, days)
+        emit(
+            {
+                "feed_uuid": feed["uuid"],
+                "title": feed["title"],
+                "retention_days": feed["retention_days"],
+            },
+            as_json=args.json,
+        )
+        return
+    # get
+    feed = store.get_feed(args.feed)
+    if not feed:
+        raise SystemExit(f"feed not found: {args.feed}")
+    emit(dict(feed), as_json=args.json)
+
+
+def cmd_gc(args, store):
+    removed = store.gc(dry_run=args.dry_run)
+    emit(removed, as_json=args.json)
+
+
+def cmd_delete(args, store):
+    store.delete_item(args.item, force=args.force)
+    emit({"deleted": args.item}, as_json=args.json)
+
+
+def _open_path(path):
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    elif os.name == "nt":
+        os.startfile(path)  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def cmd_open(args, store):
+    rev = store.get_revision(args.revision)
+    if not rev:
+        raise SystemExit(f"revision not found: {args.revision}")
+    dest = tempfile.mkdtemp(prefix="rss-saver-open-")
+    paths = store.export_revision(args.revision, dest)
+    target = paths.get("html") or paths.get("png")
+    if not target:
+        raise SystemExit("revision has no HTML or PNG to open")
+    print(target)
+    if not args.no_launch:
+        _open_path(target)
+
+
+def cmd_serve(args, store):
+    since = parse_since(args.since) if args.since else None
+    port = int(args.port)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *fmt_args):
+            pass
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path in ("/", "/index.html"):
+                rows = store.list_new(since) if since else store.list_items(limit=200)
+                body = [
+                    "<!doctype html><meta charset=utf-8><title>rss-saver</title>",
+                    "<style>body{font-family:sans-serif;max-width:960px;margin:2rem auto}"
+                    "a{color:#06c} .meta{color:#666;font-size:0.9em}</style>",
+                    "<h1>rss-saver archive</h1>",
+                ]
+                if since:
+                    body.append(f"<p class=meta>Since {since}</p>")
+                body.append("<ul>")
+                for r in rows:
+                    ru = r.get("revision_uuid")
+                    title = (r.get("title") or "(untitled)").replace("<", "&lt;")
+                    feed = (r.get("feed_title") or "").replace("<", "&lt;")
+                    body.append(
+                        f"<li><strong>{feed}</strong>: "
+                        f"<a href='/r/{ru}.html'>{title}</a> "
+                        f"<a href='/r/{ru}.png'>[png]</a> "
+                        f"<span class=meta>rev {r.get('rev')} "
+                        f"{r.get('downloaded_at')}</span></li>"
+                    )
+                body.append("</ul>")
+                data = "\n".join(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if path.startswith("/r/") and path.endswith(".html"):
+                key = path[len("/r/") : -len(".html")]
+                rev = store.get_revision(key)
+                if not rev or not rev["html"]:
+                    self.send_error(404)
+                    return
+                data = rev["html"].encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if path.startswith("/r/") and path.endswith(".png"):
+                key = path[len("/r/") : -len(".png")]
+                rev = store.get_revision(key)
+                if not rev or not rev["screenshot"]:
+                    self.send_error(404)
+                    return
+                data = rev["screenshot"]
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_error(404)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}/"
+    print(f"Serving {store.path} at {url}  (Ctrl+C to stop)")
+    if args.open_browser:
+        _open_path(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()
+
+
+def cmd_tui(args, store):
+    try:
+        from rss_saver_tui import run_tui
+    except ImportError as exc:
+        raise SystemExit(
+            "TUI requires the 'textual' package. Install with: pip install textual\n"
+            f"({exc})"
+        ) from exc
+    run_tui(store)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="RSS Saver 2.1 — SQLite feed archive with delta pulls, revisions, and review CLI."
+    )
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--db",
+        default=None,
+        help=f"SQLite database path (default: {default_db_path()})",
+    )
+    shared.add_argument("--json", action="store_true", help="JSON output for agents")
+
+    sub = parser.add_subparsers(dest="command")
+
+    p_pull = sub.add_parser("pull", parents=[shared], help="Delta-pull feed(s) into the database")
+    p_pull.add_argument("--url", "-u")
+    p_pull.add_argument("--opml", "-p")
+    p_pull.add_argument("--type", "-t", choices=["full", "simple"])
+    p_pull.add_argument("--dl", action="store_true", help="Also write HTML/PNG/INDEX.md to disk")
+    p_pull.add_argument("--output", "-o", help="Output directory (required with --dl)")
+    p_pull.add_argument("--jobs", type=int, default=8, help="Parallel feed workers (default 8)")
+    p_pull.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-fetch pages even when a revision may exist (still skips identical hashes)",
+    )
+    p_pull.add_argument("--gc", action="store_true", help="Run retention GC after pull")
+    p_pull.set_defaults(func=cmd_pull)
+
+    p_new = sub.add_parser("new", parents=[shared], help="Revisions downloaded since a time window")
+    p_new.add_argument("--since", required=True, help="e.g. 8h, 7d, or ISO timestamp")
+    p_new.set_defaults(func=cmd_new)
+
+    p_feeds = sub.add_parser("feeds", parents=[shared], help="List feeds")
+    p_feeds.add_argument("--updated-since", dest="updated_since")
+    p_feeds.set_defaults(func=cmd_feeds)
+
+    p_list = sub.add_parser("list", parents=[shared], help="List items/revisions")
+    p_list.add_argument("--feed")
+    p_list.add_argument("--tag")
+    p_list.add_argument("--since")
+    p_list.add_argument("--until")
+    p_list.add_argument("--url-filter", dest="url_filter")
+    p_list.add_argument("--limit", type=int, default=50)
+    p_list.add_argument("--all-revisions", action="store_true")
+    p_list.add_argument("--sort", choices=["downloaded", "published"], default="downloaded")
+    p_list.set_defaults(func=cmd_list)
+
+    p_search = sub.add_parser("search", parents=[shared], help="Full-text search")
+    p_search.add_argument("query")
+    p_search.add_argument("--feed")
+    p_search.add_argument("--tag")
+    p_search.add_argument("--since")
+    p_search.add_argument("--limit", type=int, default=50)
+    p_search.set_defaults(func=cmd_search)
+
+    p_revs = sub.add_parser("revisions", parents=[shared], help="Revision history for an item UUID/URL")
+    p_revs.add_argument("item")
+    p_revs.set_defaults(func=cmd_revisions)
+
+    p_show = sub.add_parser("show", parents=[shared], help="Show revision metadata")
+    p_show.add_argument("revision")
+    p_show.add_argument("--meta-only", action="store_true")
+    p_show.set_defaults(func=cmd_show)
+
+    p_export = sub.add_parser("export", parents=[shared], help="Export revision BLOBs to a directory")
+    p_export.add_argument("revision", nargs="?")
+    p_export.add_argument("--since")
+    p_export.add_argument("--output", "-o")
+    p_export.set_defaults(func=cmd_export)
+
+    p_tag = sub.add_parser("tag", parents=[shared], help="Tag management")
+    p_tag.add_argument("tag_action", choices=["add", "rm", "list"])
+    p_tag.add_argument("item", nargs="?")
+    p_tag.add_argument("names", nargs="*")
+    p_tag.set_defaults(func=cmd_tag)
+
+    p_freeze = sub.add_parser("freeze", parents=[shared], help="Freeze an item (exempt from GC)")
+    p_freeze.add_argument("item")
+    p_freeze.set_defaults(func=cmd_freeze)
+
+    p_unfreeze = sub.add_parser("unfreeze", parents=[shared], help="Unfreeze an item")
+    p_unfreeze.add_argument("item")
+    p_unfreeze.set_defaults(func=cmd_unfreeze)
+
+    p_ret = sub.add_parser("retention", parents=[shared], help="Get/set per-feed retention days")
+    p_ret.add_argument("retention_action", choices=["get", "set"])
+    p_ret.add_argument("--feed", required=True)
+    p_ret.add_argument("days", nargs="?", help="Days, or 0/unlimited for no limit")
+    p_ret.set_defaults(func=cmd_retention)
+
+    p_gc = sub.add_parser("gc", parents=[shared], help="Apply per-feed retention (skips frozen items)")
+    p_gc.add_argument("--dry-run", action="store_true")
+    p_gc.set_defaults(func=cmd_gc)
+
+    p_del = sub.add_parser("delete", parents=[shared], help="Delete an item and all revisions")
+    p_del.add_argument("item")
+    p_del.add_argument("--force", action="store_true", help="Allow deleting frozen items")
+    p_del.set_defaults(func=cmd_delete)
+
+    p_open = sub.add_parser("open", parents=[shared], help="Export a revision and open in the browser")
+    p_open.add_argument("revision")
+    p_open.add_argument("--no-launch", action="store_true")
+    p_open.set_defaults(func=cmd_open)
+
+    p_serve = sub.add_parser("serve", parents=[shared], help="Serve HTML/PNG from the DB on localhost")
+    p_serve.add_argument("--port", default=8765)
+    p_serve.add_argument("--since")
+    p_serve.add_argument("--open-browser", action="store_true")
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_tui = sub.add_parser("tui", parents=[shared], help="Interactive Textual TUI")
+    p_tui.set_defaults(func=cmd_tui)
+
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+
+    known = {
+        "pull", "new", "feeds", "list", "search", "revisions", "show", "export",
+        "tag", "freeze", "unfreeze", "retention", "gc", "delete", "open", "serve", "tui",
+    }
+
+    if not argv or argv[0] in ("-h", "--help"):
+        parser.print_help()
+        return
+
+    # If a known subcommand appears anywhere before the first non-option that
+    # isn't a flag value, use argv as-is. Otherwise treat as legacy pull flags.
+    has_command = any(a in known for a in argv if not a.startswith("-"))
+    if has_command:
+        # Move subcommand to front if globals precede it: --db x feeds → feeds --db x
+        cmd_idx = next(i for i, a in enumerate(argv) if a in known)
+        if cmd_idx > 0:
+            argv = [argv[cmd_idx]] + argv[:cmd_idx] + argv[cmd_idx + 1 :]
+        args = parser.parse_args(argv)
+    else:
+        args = parser.parse_args(["pull"] + argv)
+
+    db_path = getattr(args, "db", None) or default_db_path()
+    store = Store(db_path)
+    try:
+        if not hasattr(args, "func"):
+            parser.print_help()
+            return
+        args.func(args, store)
+    finally:
+        store.close()
+
 
 if __name__ == "__main__":
     main()

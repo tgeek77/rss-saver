@@ -1,168 +1,168 @@
 # What is RSS Saver?
 
-**Version 2.0**
+**Version 2.1**
 
-RSS Saver saves an RSS or Atom feed from a blog, podcast, YouTube feed, newspaper, etc. as local HTML files and optional full-page screenshots. You can then use Linux/Unix tools like `grep` to search those files quickly and easily.
+RSS Saver archives RSS/Atom feeds (and OPML lists) into a local **SQLite** database for fast, delta-only collection, revision history, search, tagging, and review. Optional full-page screenshots use Chrome, Brave, Chromium, or auto-installed `chrome-headless-shell`.
 
-It also accepts **OPML** subscription lists, downloading every listed feed into its own directory with a Markdown index of what was saved.
+It is built for OSINT-style feed monitoring: hourly cron pulls only what changed, morning review shows what’s new, and frozen articles survive per-feed retention limits.
+
+## What's new in 2.1
+
+- **SQLite default store** (HTML + PNG BLOBs, metadata, FTS5 search, tags)
+- **Delta-only pulls** — skip unchanged content by hash; new hash → new **revision**
+- **Parallel feed fetch** (`--jobs`, default 8)
+- **UUIDs**, **freeze**, and per-feed **retention** (default unlimited)
+- Review CLI: `new`, `feeds`, `list`, `search`, `serve`, `export`, …
+- Optional **Textual TUI** (`rss-saver.py tui`)
+- **`--dl`** — also write classic per-feed folders + `INDEX.md` on disk
 
 ## What's new in 2.0
 
-- **OPML** input (`--opml` / `-p`) for batch-saving many feeds
-- Per-feed output directories with an **`INDEX.md`** (published/downloaded dates, screenshot names, article URLs)
-- **`--checkup`** to skip articles already listed in `INDEX.md`
-- Optional **full-page screenshots** via Chrome, Brave, Chromium, or auto-installed `chrome-headless-shell`
-- Offline-friendly HTML: absolute URLs, inlined stylesheets, source URL at the bottom of each page
+- OPML input, per-feed dirs / `INDEX.md`, screenshots, offline-friendly HTML
 
 # How do I use it?
 
-## Prerequisites and Installation
+## Prerequisites
 
-RSS Saver is a Python script that requires a few dependencies: BeautifulSoup4, feedparser, requests.
+* BeautifulSoup4, feedparser, requests
+* Optional TUI: `pip install textual`
+* Optional screenshots: Chrome / Brave / Chromium (or auto `chrome-headless-shell`)
 
-You can install these dependencies with the following commands. If you are using Mac or Windows, you'll probably want to use WSL or research these on your own:
+```
+# Debian/Ubuntu
+apt install python3-bs4 python3-feedparser python3-requests
 
-* Debian, Ubuntu
-`apt install python3-bs4 python3-feedparser python3-requests`
-
-* Arch
-`pacman -S python-beautifulsoup4 python-feedparser python-requests`
-
-* OpenSUSE
-`zypper in python3-feedparser python3-requests python3-beautifulsoup4`
+# Arch
+pacman -S python-beautifulsoup4 python-feedparser python-requests
+```
 
 ### Screenshots (optional)
 
-HTML saving works without a browser. Screenshots use this both/and policy:
+HTML saving works without a browser. Screenshots:
 
-1. **Prefer an installed Chrome-based browser** if found: Google Chrome, Brave, or Chromium  
-   (`RSS_SAVER_BROWSER` / `CHROME_BIN` override, then `PATH`, then macOS `/Applications` paths).
-2. **Otherwise**, if this OS/arch supports Google’s `chrome-headless-shell`  
-   (Linux x86_64/ARM64, macOS Intel/Apple Silicon, Windows), **download and cache** it under  
-   `~/.cache/rss-saver/chrome-headless-shell/` and use that.
-3. **Otherwise** (e.g. OpenBSD with no Chromium installed): print a warning that screenshots  
-   are unavailable until a Chrome-based browser is installed. HTML still saves.
+1. Prefer installed Chrome / Brave / Chromium (`RSS_SAVER_BROWSER` / `CHROME_BIN`, then `PATH`, then macOS apps).
+2. Else auto-download `chrome-headless-shell` when the OS/arch is supported (Linux/macOS/Windows CfT platforms).
+3. Else warn that screenshots are unavailable; HTML still saves.
 
-Install examples when you want a system browser (or when headless-shell isn’t available):
+## Database location
 
-* Arch: `sudo pacman -S chromium` (or install Brave / Google Chrome)
-* Debian/Ubuntu: `sudo apt install chromium`
-* macOS: `brew install --cask chromium` (or Chrome / Brave)
-* OpenBSD: `doas pkg_add chromium`
+Default DB: `$XDG_DATA_HOME/rss-saver/rss-saver.db` or `~/.local/share/rss-saver/rss-saver.db`.
 
-Or set `RSS_SAVER_BROWSER=/path/to/chrome-or-chromium`.
+Override with `--db /path/to/file.db` on any command.
 
-Once the Python prerequisites are installed, you can either save the script [directly](https://raw.githubusercontent.com/tgeek77/rss-saver/main/rss-saver.py) or download/clone this repository.
+## Pull (delta by default)
 
-Run `python3 rss-saver.py` to run the script with the options below.
+```bash
+# Single feed → SQLite only
+./rss-saver.py pull -u https://example.com/feed.xml -t full
 
-## Run RSS Saver
+# Large OPML, parallel workers (cron-friendly)
+./rss-saver.py pull -p ~/intel.opml -t full --jobs 8
 
-`--output` and `--type` are required. Provide exactly one of `--url` or `--opml`.
+# Also write HTML/PNG/INDEX.md under ~/feeds
+./rss-saver.py pull -u https://example.com/feed.xml -t full --dl -o ~/feeds
 
+# Legacy flag style still works (implies pull)
+./rss-saver.py -u https://example.com/feed.xml -t full
 ```
-usage: rss-saver.py [-h] [--url URL] [--opml OPML] [--output OUTPUT]
-                    [--type {full,simple}] [--checkup]
 
-An RSS/Atom/OPML feed article downloader.
+| Situation | Behavior |
+|-----------|----------|
+| New article URL | Fetch and store revision 1 |
+| Same URL, same content hash | **Skip** |
+| Same URL, different content | Store new revision (history kept) |
+| `--force` | Always re-fetch; still skip insert if hash unchanged |
 
-options:
-  -h, --help                    show this help message and exit
-  --url URL, -u URL             URL of a single RSS/Atom feed
-  --opml OPML, -p OPML          Path or URL of an OPML file listing feeds
-  --output OUTPUT, -o OUTPUT    Directory to save articles into
-  --type {full,simple}, -t      full: HTML + screenshot; simple: screenshot only
-  --checkup, -c                 Only download articles not already in INDEX.md
-```
+`--checkup` is no longer required — delta is always on.
 
 ### Modes
 
 | Type | HTML | Screenshot |
 |------|------|------------|
-| `full` | Always | When a Chrome-based browser (or headless-shell) is available |
-| `simple` | No | When a Chrome-based browser (or headless-shell) is available (required) |
+| `full` | Yes | When a Chrome-based browser is available |
+| `simple` | No | Required (browser) |
 
-If no browser is available: `full` still saves HTML and prints an install hint; `simple` prints the hint and does nothing (does not crash).
+## Review and query
 
-### Single feed
-
-```
-./rss-saver.py -u https://example.com/feed.xml -o ~/feeds -t full
-```
-
-### OPML (many feeds)
-
-```
-./rss-saver.py --opml ~/subscriptions.opml -o ~/feeds -t full
-./rss-saver.py -p https://example.com/feeds.opml -o ~/feeds -t simple
-```
-
-### Checkup (only new items)
-
-Re-run the same feed or OPML later without re-downloading articles already listed in that feed’s `INDEX.md` (matched by article URL):
-
-```
-./rss-saver.py -u https://example.com/feed.xml -o ~/feeds -t full --checkup
-./rss-saver.py -p ~/subscriptions.opml -o ~/feeds -t full -c
+```bash
+./rss-saver.py new --since 8h
+./rss-saver.py new --since 8h --json          # agent-friendly
+./rss-saver.py feeds --updated-since 8h
+./rss-saver.py list --feed FEED_UUID --limit 20
+./rss-saver.py search "ransomware" --since 7d
+./rss-saver.py revisions ITEM_UUID
+./rss-saver.py show REVISION_UUID
+./rss-saver.py serve --since 8h --port 8765 --open-browser
+./rss-saver.py open REVISION_UUID
+./rss-saver.py export REVISION_UUID -o /tmp/out
 ```
 
-Without `--checkup`, the index is rewritten for this run and matching files may be overwritten.
+## Freeze, retention, GC
 
-OPML outlines that have an `xmlUrl` attribute are treated as feeds. Category folders without `xmlUrl` are skipped for nesting (feeds are saved flat under `--output`).
+Default retention is **unlimited**. Set a per-feed age limit (days); frozen items are never deleted by GC.
 
-### Output layout
-
-Each feed gets its own subdirectory under `--output`, named from the feed title (or OPML title). Inside that directory:
-
-```
-~/feeds/
-  ExampleBlog/
-    INDEX.md
-    SomeArticleTitle.html
-    SomeArticleTitle.png
-  AnotherFeed/
-    INDEX.md
-    ...
+```bash
+./rss-saver.py retention set --feed FEED_UUID_OR_URL 30   # 1 month
+./rss-saver.py retention set --feed FEED_UUID_OR_URL 0    # unlimited again
+./rss-saver.py freeze ITEM_UUID     # keep forever despite feed limit
+./rss-saver.py unfreeze ITEM_UUID
+./rss-saver.py gc --dry-run
+./rss-saver.py gc
+./rss-saver.py delete ITEM_UUID --force   # even if frozen
 ```
 
-`INDEX.md` is a human-readable index of everything currently in that feed directory:
+Example: a politics feed keeps articles 30 days, but a frozen “Trump visit to London…” item remains until you unfreeze + `gc` or `delete --force`.
 
-- Feed URL
-- Last updated timestamp (UTC)
-- Type (`full` or `simple`)
-- Article count
-- Table of file name, title, published date (from the feed), downloaded date, screenshot filename, and article URL
+## Tags
 
-Each `.html` file ends with a visible `URL: ...` line at the bottom of the page (valid HTML, so formatting stays intact). Linked site stylesheets are inlined so `file://` viewing keeps the theme.
+```bash
+./rss-saver.py tag add ITEM_UUID ibm apt
+./rss-saver.py tag rm ITEM_UUID ibm
+./rss-saver.py tag list ITEM_UUID
+./rss-saver.py list --tag apt
+```
+
+## TUI
+
+```bash
+pip install textual
+./rss-saver.py tui
+```
+
+Browse what’s new, feeds, search, freeze, set retention, open HTML/PNG.
+
+## Cron example
+
+```bash
+0 * * * * /path/to/rss-saver.py pull -p /home/you/intel.opml -t full --jobs 8 --db /home/you/.local/share/rss-saver/intel.db
+0 8 * * * /path/to/rss-saver.py gc --db /home/you/.local/share/rss-saver/intel.db
+```
+
+Morning:
+
+```bash
+./rss-saver.py new --since 8h --db ~/.local/share/rss-saver/intel.db
+./rss-saver.py serve --since 8h --open-browser
+```
+
+## Disk layout with `--dl`
+
+Same as 2.0: per-feed directories under `--output` with `INDEX.md`, `.html`, `.png`. The database remains the source of truth for delta/revisions.
 
 # Advanced Usage
 
-In the [resources](resources/) directory, you will find `rss_list.txt`. This is a list of 2875 RSS feeds.
+In [resources/](resources/) see `rss_list.txt` (~2875 feeds). Prefer a curated OPML over downloading everything.
 
-You can extract the feeds you want into `my_rss_list` and download them daily like this:
-
-```
-for feed in `cat my_rss_list`;
-    do ./rss-saver.py --url $feed -o ~/feeds/ -t full --checkup;
-done
+```bash
+./rss-saver.py pull -p ~/my_feeds.opml -t full --jobs 8
 ```
 
-Or put those URLs into an OPML file and run once with `--opml`.
-
-I would **not** suggest downloading all 2877 feeds. Choose the ones that you want to monitor and add them your own list. While large, this list is also not exhaustive. Add your own!
-
-All credits to [Kovid Goyal](https://github.com/kovidgoyal/calibre) for rss_list which is used in [Calibre](https://calibre-ebook.com/).
+Credits to [Kovid Goyal](https://github.com/kovidgoyal/calibre) / Calibre for `rss_list`.
 
 # Why?
 
-Why not just use an RSS reader?
-
-RSS Readers are for reading news feeds only by humans. They are not meant for long-term storage or for quick searching multiple news articles at once.
-
-If you need to keep an eye on any mention of "IBM" in the news, make a list of rss feeds for all of the news sources that you want to monitor, download the articles from those feeds, and search them quickly from your local filesystem.
+RSS readers are for reading. RSS Saver is for **keeping**, **diffing revisions**, and **searching** a local archive quickly — without ArchiveBox-scale multi-extractor cost per URL.
 
 # Future
 
-I am a novice programmer. This code should be cleaned up to avoid a lot of repitition but for now it works.
-
-I would eventually like to see it have a database backend with very good search functionality.
+Possible 2.2: watchlist alerts and light IOC extraction. Stay feed-native and fast.
