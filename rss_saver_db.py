@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS feeds (
@@ -70,6 +70,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS revisions_fts USING fts5(
 );
 
 CREATE INDEX IF NOT EXISTS idx_revisions_item ON revisions(item_id);
+CREATE INDEX IF NOT EXISTS idx_revisions_published ON revisions(published_at);
 CREATE INDEX IF NOT EXISTS idx_revisions_downloaded ON revisions(downloaded_at);
 CREATE INDEX IF NOT EXISTS idx_items_feed ON items(feed_id);
 CREATE INDEX IF NOT EXISTS idx_feeds_fetched ON feeds(last_fetched_at);
@@ -157,6 +158,28 @@ class Store:
             self.conn.executescript(SCHEMA_SQL)
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.conn.commit()
+            return
+        if version < 2:
+            # Publish time is the sole temporal axis; leave missing as NULL.
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_revisions_published ON revisions(published_at)"
+            )
+            self.conn.execute("PRAGMA user_version = 2")
+            self.conn.commit()
+            version = 2
+        if version < 3:
+            # Earlier builds stamped pull time into published_at when the feed
+            # had no date, which made years-old posts look brand-new in New.
+            self.conn.execute(
+                """
+                UPDATE revisions
+                SET published_at = NULL
+                WHERE published_at IS NOT NULL
+                  AND published_at = downloaded_at
+                """
+            )
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.conn.commit()
 
     # --- feeds ---
 
@@ -213,17 +236,20 @@ class Store:
                        (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id) AS item_count,
                        (SELECT COUNT(*) FROM revisions r
                         JOIN items i ON i.id = r.item_id
-                        WHERE i.feed_id = f.id AND r.downloaded_at >= ?) AS new_revs
+                        WHERE i.feed_id = f.id AND r.published_at >= ?) AS new_revs
                 FROM feeds f
-                WHERE f.last_fetched_at >= ?
-                   OR EXISTS (
+                WHERE EXISTS (
                        SELECT 1 FROM revisions r
                        JOIN items i ON i.id = r.item_id
-                       WHERE i.feed_id = f.id AND r.downloaded_at >= ?
+                       WHERE i.feed_id = f.id AND r.published_at >= ?
                    )
-                ORDER BY f.last_fetched_at DESC, f.title
+                ORDER BY (
+                    SELECT MAX(r.published_at) FROM revisions r
+                    JOIN items i ON i.id = r.item_id
+                    WHERE i.feed_id = f.id
+                ) DESC, f.title
                 """,
-                (updated_since, updated_since, updated_since),
+                (updated_since, updated_since),
             ).fetchall()
         return self.conn.execute(
             """
@@ -358,6 +384,9 @@ class Store:
             next_rev = int(row["m"]) + 1
             rev_uuid = new_uuid()
             downloaded = utc_now()
+            # Only store a real feed publish date. Never invent one from pull
+            # time — that made undated historical posts look newly published.
+            published = (published_at or "").strip() or None
             try:
                 cur = self.conn.execute(
                     """
@@ -372,7 +401,7 @@ class Store:
                         next_rev,
                         content_hash,
                         title,
-                        published_at or None,
+                        published,
                         downloaded,
                         mode,
                         html,
@@ -421,8 +450,54 @@ class Store:
             self.conn.execute("DELETE FROM items WHERE id = ?", (item["id"],))
             self.conn.commit()
 
+    def delete_feed(self, feed_key: str, force: bool = False) -> dict[str, Any]:
+        """
+        Delete a feed and all of its items/revisions.
+        Refuses if any item is frozen unless force=True.
+        """
+        with self._lock:
+            feed = self.get_feed(feed_key)
+            if not feed:
+                raise KeyError(f"feed not found: {feed_key}")
+            frozen = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM items WHERE feed_id = ? AND frozen = 1",
+                (feed["id"],),
+            ).fetchone()["c"]
+            if frozen and not force:
+                raise PermissionError(
+                    f"feed {feed['uuid']} has {frozen} frozen item(s); pass --force to delete"
+                )
+            rev_ids = [
+                r["id"]
+                for r in self.conn.execute(
+                    """
+                    SELECT r.id FROM revisions r
+                    JOIN items i ON i.id = r.item_id
+                    WHERE i.feed_id = ?
+                    """,
+                    (feed["id"],),
+                )
+            ]
+            for rid in rev_ids:
+                self.conn.execute(
+                    "INSERT INTO revisions_fts(revisions_fts, rowid) VALUES('delete', ?)",
+                    (rid,),
+                )
+            item_count = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM items WHERE feed_id = ?", (feed["id"],)
+            ).fetchone()["c"]
+            self.conn.execute("DELETE FROM feeds WHERE id = ?", (feed["id"],))
+            self.conn.commit()
+            return {
+                "feed_uuid": feed["uuid"],
+                "url": feed["url"],
+                "title": feed["title"],
+                "items_deleted": item_count,
+                "revisions_deleted": len(rev_ids),
+            }
+
     def gc(self, dry_run: bool = False) -> list[dict[str, Any]]:
-        """Delete unfrozen items whose newest revision is older than feed retention."""
+        """Delete unfrozen items whose newest publish date is older than feed retention."""
         feeds = self.conn.execute(
             "SELECT * FROM feeds WHERE retention_days IS NOT NULL AND retention_days > 0"
         ).fetchall()
@@ -435,8 +510,8 @@ class Store:
             items = self.conn.execute(
                 """
                 SELECT i.*,
-                       (SELECT MAX(r.downloaded_at) FROM revisions r WHERE r.item_id = i.id)
-                         AS newest
+                       (SELECT MAX(COALESCE(r.published_at, r.downloaded_at))
+                        FROM revisions r WHERE r.item_id = i.id) AS newest
                 FROM items i
                 WHERE i.feed_id = ? AND i.frozen = 0
                 """,
@@ -450,7 +525,7 @@ class Store:
                     {
                         "item_uuid": item["uuid"],
                         "url": item["url"],
-                        "newest": newest,
+                        "newest_published": newest,
                         "feed": feed["title"] or feed["url"],
                         "retention_days": feed["retention_days"],
                     }
@@ -528,6 +603,11 @@ class Store:
     # --- queries ---
 
     def list_new(self, since: str) -> list[dict[str, Any]]:
+        """
+        Revisions with a real feed publish date within the window.
+        Undated revisions (published_at NULL) are excluded — pull time is
+        metadata only and must not appear as "published".
+        """
         rows = self.conn.execute(
             """
             SELECT r.uuid AS revision_uuid, r.rev, r.title, r.downloaded_at,
@@ -538,8 +618,10 @@ class Store:
             FROM revisions r
             JOIN items i ON i.id = r.item_id
             JOIN feeds f ON f.id = i.feed_id
-            WHERE r.downloaded_at >= ?
-            ORDER BY COALESCE(r.published_at, r.downloaded_at) DESC
+            WHERE r.published_at IS NOT NULL
+              AND r.published_at != ''
+              AND r.published_at >= ?
+            ORDER BY r.published_at DESC
             """,
             (since,),
         ).fetchall()
@@ -555,7 +637,7 @@ class Store:
         url: Optional[str] = None,
         limit: int = 50,
         all_revisions: bool = False,
-        sort: str = "downloaded",
+        sort: str = "published",
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -578,18 +660,18 @@ class Store:
             clauses.append("i.url = ?")
             params.append(url)
         if since:
-            clauses.append("r.downloaded_at >= ?")
+            clauses.append("r.published_at >= ?")
             params.append(since)
         if until:
-            clauses.append("r.downloaded_at <= ?")
+            clauses.append("r.published_at <= ?")
             params.append(until)
         if not all_revisions:
             clauses.append("r.id = i.latest_revision_id")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         order = (
-            "r.published_at DESC"
-            if sort == "published"
-            else "r.downloaded_at DESC"
+            "r.downloaded_at DESC"
+            if sort == "downloaded"
+            else "r.published_at DESC"
         )
         sql = f"""
             SELECT r.uuid AS revision_uuid, r.rev, r.title, r.downloaded_at,
@@ -651,11 +733,12 @@ class Store:
             )
             params.append(tag)
         if since:
-            clauses.append("r.downloaded_at >= ?")
+            clauses.append("r.published_at >= ?")
             params.append(since)
         where = " AND ".join(clauses)
         sql = f"""
-            SELECT r.uuid AS revision_uuid, r.rev, r.title, r.downloaded_at,
+            SELECT r.uuid AS revision_uuid, r.rev, r.title, r.published_at,
+                   r.downloaded_at,
                    i.uuid AS item_uuid, i.url, i.frozen,
                    f.title AS feed_title,
                    snippet(revisions_fts, 1, '[', ']', '…', 20) AS snippet
@@ -664,7 +747,7 @@ class Store:
             JOIN items i ON i.id = r.item_id
             JOIN feeds f ON f.id = i.feed_id
             WHERE {where}
-            ORDER BY rank
+            ORDER BY r.published_at DESC
             LIMIT ?
         """
         params.append(limit)
@@ -673,22 +756,35 @@ class Store:
         except sqlite3.OperationalError:
             # Fallback: LIKE search if FTS query syntax fails
             like = f"%{query}%"
+            like_clauses = ["(r.title LIKE ? OR r.html LIKE ?)"]
+            like_params: list[Any] = [like, like]
+            if feed:
+                frow = self.get_feed(feed)
+                if not frow:
+                    return []
+                like_clauses.append("f.id = ?")
+                like_params.append(frow["id"])
+            if since:
+                like_clauses.append("r.published_at >= ?")
+                like_params.append(since)
+            like_params.append(limit)
             return [
                 dict(r)
                 for r in self.conn.execute(
-                    """
-                    SELECT r.uuid AS revision_uuid, r.rev, r.title, r.downloaded_at,
+                    f"""
+                    SELECT r.uuid AS revision_uuid, r.rev, r.title, r.published_at,
+                           r.downloaded_at,
                            i.uuid AS item_uuid, i.url, i.frozen,
                            f.title AS feed_title,
                            '' AS snippet
                     FROM revisions r
                     JOIN items i ON i.id = r.item_id
                     JOIN feeds f ON f.id = i.feed_id
-                    WHERE r.title LIKE ? OR r.html LIKE ?
-                    ORDER BY r.downloaded_at DESC
+                    WHERE {" AND ".join(like_clauses)}
+                    ORDER BY r.published_at DESC
                     LIMIT ?
                     """,
-                    (like, like, limit),
+                    like_params,
                 ).fetchall()
             ]
 

@@ -421,15 +421,38 @@ def parse_opml(source):
 
 
 def format_entry_date(entry):
-    """Best-effort article date from feedparser entry fields (UTC ISO)."""
+    """Best-effort article date from feedparser entry fields (UTC ISO), or ''."""
     for key in ("published_parsed", "updated_parsed", "created_parsed"):
         parsed = getattr(entry, key, None)
         if parsed:
-            return datetime(*parsed[:6], tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                return datetime(*parsed[:6], tzinfo=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            except (TypeError, ValueError):
+                pass
     for key in ("published", "updated", "created"):
         value = getattr(entry, key, None)
-        if value:
-            return str(value)
+        if not value:
+            continue
+        # Prefer structured parse of RFC2822 / common feed date strings
+        try:
+            from email.utils import parsedate_to_datetime
+
+            dt = parsedate_to_datetime(str(value))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError, IndexError, OverflowError):
+            pass
+        try:
+            raw = str(value).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
     return ""
 
 
@@ -1091,13 +1114,26 @@ def pull_feed(
     }
 
 
-def cmd_pull(args, store):
-    if not args.type:
-        raise SystemExit("pull requires --type/-t (full or simple)")
-    if bool(args.url) == bool(args.opml):
-        raise SystemExit("Specify exactly one of --url/-u or --opml/-p")
-    if args.dl and not args.output:
-        raise SystemExit("--dl requires --output/-o")
+def run_pull_feeds(
+    store,
+    feeds,
+    mode,
+    *,
+    jobs=8,
+    output_root=None,
+    download_files=False,
+    force=False,
+    run_gc=False,
+    as_json=False,
+):
+    """
+    Delta-pull a list of {"url", "title"} feeds. Returns result dicts.
+    Skips unchanged content hashes; only stores new URLs / changed revisions.
+    """
+    if not feeds:
+        return []
+    if mode == "simple":
+        pass  # validated after browser resolve
 
     browser_path = resolve_browser_for_screenshots()
     browser_session = None
@@ -1118,21 +1154,10 @@ def cmd_pull(args, store):
         else:
             print(screenshot_unavailable_hint(), file=sys.stderr)
 
-        if args.type == "simple" and browser_session is None:
+        if mode == "simple" and browser_session is None:
             raise SystemExit(
                 "simple mode requires a Chrome-based browser for screenshots"
             )
-
-        if args.opml:
-            try:
-                feeds = parse_opml(args.opml)
-            except (OSError, ElementTree.ParseError, requests.RequestException) as exc:
-                raise SystemExit(f"Failed to read OPML: {exc}") from exc
-            if not feeds:
-                raise SystemExit("No feeds with xmlUrl found in OPML")
-            print(f"Found {len(feeds)} feed(s) in OPML; jobs={args.jobs}")
-        else:
-            feeds = [{"url": args.url, "title": ""}]
 
         results = []
 
@@ -1140,40 +1165,105 @@ def cmd_pull(args, store):
             return pull_feed(
                 store,
                 item["url"],
-                args.type,
+                mode,
                 preferred_title=item.get("title") or None,
-                output_root=args.output,
-                download_files=args.dl,
-                force=args.force,
+                output_root=output_root,
+                download_files=download_files,
+                force=force,
                 browser_session=browser_session,
                 browser_lock=browser_lock,
             )
 
-        jobs = max(1, int(args.jobs))
-        if jobs == 1 or len(feeds) == 1:
+        workers = max(1, int(jobs))
+        print(f"Updating {len(feeds)} feed(s); jobs={workers}")
+        if workers == 1 or len(feeds) == 1:
             for item in feeds:
                 results.append(work(item))
         else:
-            with ThreadPoolExecutor(max_workers=jobs) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(work, item): item for item in feeds}
                 for fut in as_completed(futs):
                     try:
                         results.append(fut.result())
                     except Exception as exc:
                         item = futs[fut]
-                        print(f"Feed worker failed for {item['url']}: {exc}", file=sys.stderr)
+                        print(
+                            f"Feed worker failed for {item['url']}: {exc}",
+                            file=sys.stderr,
+                        )
                         results.append(
-                            {"feed": item["url"], "new": 0, "skipped": 0, "errors": 1}
+                            {
+                                "feed": item["url"],
+                                "new": 0,
+                                "skipped": 0,
+                                "errors": 1,
+                            }
                         )
 
-        if args.gc:
+        if run_gc:
             removed = store.gc(dry_run=False)
             print(f"GC removed {len(removed)} item(s)")
 
-        emit(results, as_json=args.json, columns=["feed", "new", "skipped", "errors"])
+        emit(results, as_json=as_json, columns=["feed", "new", "skipped", "errors"])
+        return results
     finally:
         if browser_session is not None:
             browser_session.close()
+
+
+def cmd_pull(args, store):
+    if not args.type:
+        raise SystemExit("pull requires --type/-t (full or simple)")
+    sources = sum(bool(x) for x in (args.url, args.opml, getattr(args, "all", False)))
+    if sources != 1:
+        raise SystemExit("Specify exactly one of --url/-u, --opml/-p, or --all")
+    if args.dl and not args.output:
+        raise SystemExit("--dl requires --output/-o")
+
+    if getattr(args, "all", False):
+        rows = store.list_feeds()
+        if not rows:
+            raise SystemExit("No feeds in the database yet; add some with add/pull first")
+        feeds = [{"url": r["url"], "title": r["title"] or ""} for r in rows]
+    elif args.opml:
+        try:
+            feeds = parse_opml(args.opml)
+        except (OSError, ElementTree.ParseError, requests.RequestException) as exc:
+            raise SystemExit(f"Failed to read OPML: {exc}") from exc
+        if not feeds:
+            raise SystemExit("No feeds with xmlUrl found in OPML")
+    else:
+        feeds = [{"url": args.url, "title": ""}]
+
+    run_pull_feeds(
+        store,
+        feeds,
+        args.type,
+        jobs=args.jobs,
+        output_root=args.output,
+        download_files=args.dl,
+        force=args.force,
+        run_gc=args.gc,
+        as_json=args.json,
+    )
+
+
+def cmd_update(args, store):
+    """Delta-pull every feed already stored in the database."""
+    mode = args.type or "full"
+    rows = store.list_feeds()
+    if not rows:
+        raise SystemExit("No feeds in the database yet; add some with add/pull first")
+    feeds = [{"url": r["url"], "title": r["title"] or ""} for r in rows]
+    run_pull_feeds(
+        store,
+        feeds,
+        mode,
+        jobs=args.jobs,
+        force=args.force,
+        run_gc=args.gc,
+        as_json=args.json,
+    )
 
 
 def cmd_new(args, store):
@@ -1216,7 +1306,6 @@ def cmd_feeds(args, store):
             "title",
             "url",
             "retention_days",
-            "last_fetched_at",
             "item_count",
             "new_revs",
         ],
@@ -1240,7 +1329,7 @@ def cmd_list(args, store):
         rows,
         as_json=args.json,
         columns=[
-            "downloaded_at",
+            "published_at",
             "feed_title",
             "title",
             "rev",
@@ -1272,7 +1361,7 @@ def cmd_revisions(args, store):
     emit(
         rows,
         as_json=args.json,
-        columns=["uuid", "rev", "downloaded_at", "title", "content_hash", "html_bytes", "png_bytes"],
+        columns=["uuid", "rev", "published_at", "title", "content_hash", "html_bytes", "png_bytes"],
     )
 
 
@@ -1358,6 +1447,41 @@ def cmd_delete(args, store):
     emit({"deleted": args.item}, as_json=args.json)
 
 
+def cmd_delete_feed(args, store):
+    try:
+        result = store.delete_feed(args.feed, force=args.force)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    except PermissionError as exc:
+        raise SystemExit(str(exc)) from exc
+    emit(result, as_json=args.json)
+
+
+def cmd_add(args, store):
+    """Register feed(s) from --url or --opml (path or https), then delta-pull them."""
+    if bool(args.url) == bool(args.opml):
+        raise SystemExit("Specify exactly one of --url/-u or --opml/-p")
+    mode = args.type or "full"
+    if args.opml:
+        try:
+            feeds = parse_opml(args.opml)
+        except (OSError, ElementTree.ParseError, requests.RequestException) as exc:
+            raise SystemExit(f"Failed to read OPML: {exc}") from exc
+        if not feeds:
+            raise SystemExit("No feeds with xmlUrl found in OPML")
+    else:
+        feeds = [{"url": args.url, "title": ""}]
+    for item in feeds:
+        store.upsert_feed(item["url"], item.get("title") or "")
+    run_pull_feeds(
+        store,
+        feeds,
+        mode,
+        jobs=args.jobs,
+        as_json=args.json,
+    )
+
+
 def _open_path(path):
     if sys.platform == "darwin":
         subprocess.Popen(["open", path])
@@ -1412,7 +1536,7 @@ def cmd_serve(args, store):
                         f"<a href='/r/{ru}.html'>{title}</a> "
                         f"<a href='/r/{ru}.png'>[png]</a> "
                         f"<span class=meta>rev {r.get('rev')} "
-                        f"{r.get('downloaded_at')}</span></li>"
+                        f"{r.get('published_at')}</span></li>"
                     )
                 body.append("</ul>")
                 data = "\n".join(body).encode("utf-8")
@@ -1471,7 +1595,71 @@ def cmd_tui(args, store):
             "TUI requires the 'textual' package. Install with: pip install textual\n"
             f"({exc})"
         ) from exc
-    run_tui(store)
+
+    def add_source(source: str, kind: str = "auto"):
+        """
+        Add an RSS URL or OPML (local path / https URL) and pull.
+        kind: 'rss', 'opml', or 'auto' (detect by .opml extension or content).
+        Returns a short status string.
+        """
+        source = (source or "").strip()
+        if not source:
+            raise ValueError("empty source")
+        lower = source.lower()
+        is_opml = kind == "opml" or (
+            kind == "auto"
+            and (
+                lower.endswith(".opml")
+                or "/opml" in lower
+                or lower.endswith(".xml")
+                and "opml" in lower
+            )
+        )
+        # Prefer explicit buttons; for auto, try OPML parse if path/url looks like opml
+        if kind == "auto":
+            if lower.endswith(".opml") or source.startswith(("http://", "https://")) and ".opml" in lower:
+                is_opml = True
+            elif not source.startswith(("http://", "https://")) and os.path.isfile(source):
+                # peek
+                try:
+                    with open(source, "rb") as f:
+                        head = f.read(200).lower()
+                    is_opml = b"<opml" in head
+                except OSError:
+                    is_opml = False
+            else:
+                is_opml = False
+
+        if is_opml or kind == "opml":
+            feeds = parse_opml(source)
+            if not feeds:
+                raise ValueError("No feeds with xmlUrl found in OPML")
+        else:
+            feeds = [{"url": source, "title": ""}]
+
+        # Register immediately so they appear in Feeds even if pull fails
+        for item in feeds:
+            store.upsert_feed(item["url"], item.get("title") or "")
+
+        results = run_pull_feeds(store, feeds, "full", jobs=4, as_json=False)
+        new_total = sum(r.get("new", 0) for r in results)
+        return f"Added {len(feeds)} feed(s); {new_total} new revision(s)"
+
+    def update_all(mode="full", jobs=8):
+        rows = store.list_feeds()
+        if not rows:
+            raise ValueError("No feeds stored yet")
+        feeds = [{"url": r["url"], "title": r["title"] or ""} for r in rows]
+        results = run_pull_feeds(store, feeds, mode, jobs=jobs, as_json=False)
+        new_total = sum(r.get("new", 0) for r in results)
+        skipped = sum(r.get("skipped", 0) for r in results)
+        errors = sum(r.get("errors", 0) for r in results)
+        return (
+            f"Updated {len(feeds)} feed(s): "
+            f"{new_total} new, {skipped} unchanged, {errors} error(s)"
+        )
+
+    run_tui(store, add_source=add_source, update_all=update_all)
 
 
 def build_parser():
@@ -1491,6 +1679,11 @@ def build_parser():
     p_pull = sub.add_parser("pull", parents=[shared], help="Delta-pull feed(s) into the database")
     p_pull.add_argument("--url", "-u")
     p_pull.add_argument("--opml", "-p")
+    p_pull.add_argument(
+        "--all",
+        action="store_true",
+        help="Delta-pull every feed already stored in the database",
+    )
     p_pull.add_argument("--type", "-t", choices=["full", "simple"])
     p_pull.add_argument("--dl", action="store_true", help="Also write HTML/PNG/INDEX.md to disk")
     p_pull.add_argument("--output", "-o", help="Output directory (required with --dl)")
@@ -1503,12 +1696,37 @@ def build_parser():
     p_pull.add_argument("--gc", action="store_true", help="Run retention GC after pull")
     p_pull.set_defaults(func=cmd_pull)
 
-    p_new = sub.add_parser("new", parents=[shared], help="Revisions downloaded since a time window")
-    p_new.add_argument("--since", required=True, help="e.g. 8h, 7d, or ISO timestamp")
+    p_update = sub.add_parser(
+        "update",
+        parents=[shared],
+        help="Delta-pull all stored feeds (only new/changed articles)",
+    )
+    p_update.add_argument(
+        "--type",
+        "-t",
+        choices=["full", "simple"],
+        default="full",
+        help="Capture mode (default: full)",
+    )
+    p_update.add_argument("--jobs", type=int, default=8)
+    p_update.add_argument("--force", action="store_true")
+    p_update.add_argument("--gc", action="store_true")
+    p_update.set_defaults(func=cmd_update)
+
+    p_new = sub.add_parser(
+        "new",
+        parents=[shared],
+        help="Articles published since a time window",
+    )
+    p_new.add_argument("--since", required=True, help="e.g. 8h, 7d, or ISO timestamp (publish time)")
     p_new.set_defaults(func=cmd_new)
 
     p_feeds = sub.add_parser("feeds", parents=[shared], help="List feeds")
-    p_feeds.add_argument("--updated-since", dest="updated_since")
+    p_feeds.add_argument(
+        "--updated-since",
+        dest="updated_since",
+        help="Feeds with articles published since this window",
+    )
     p_feeds.set_defaults(func=cmd_feeds)
 
     p_list = sub.add_parser("list", parents=[shared], help="List items/revisions")
@@ -1519,7 +1737,7 @@ def build_parser():
     p_list.add_argument("--url-filter", dest="url_filter")
     p_list.add_argument("--limit", type=int, default=50)
     p_list.add_argument("--all-revisions", action="store_true")
-    p_list.add_argument("--sort", choices=["downloaded", "published"], default="downloaded")
+    p_list.add_argument("--sort", choices=["published", "downloaded"], default="published")
     p_list.set_defaults(func=cmd_list)
 
     p_search = sub.add_parser("search", parents=[shared], help="Full-text search")
@@ -1574,6 +1792,36 @@ def build_parser():
     p_del.add_argument("--force", action="store_true", help="Allow deleting frozen items")
     p_del.set_defaults(func=cmd_delete)
 
+    p_delfeed = sub.add_parser(
+        "delete-feed",
+        parents=[shared],
+        help="Delete a feed and all of its items/revisions",
+    )
+    p_delfeed.add_argument("feed", help="Feed UUID, URL, or title")
+    p_delfeed.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow deleting a feed that contains frozen items",
+    )
+    p_delfeed.set_defaults(func=cmd_delete_feed)
+
+    p_add = sub.add_parser(
+        "add",
+        parents=[shared],
+        help="Add an RSS URL or OPML (path or https URL) and pull it",
+    )
+    p_add.add_argument("--url", "-u", help="Single RSS/Atom feed URL")
+    p_add.add_argument("--opml", "-p", help="OPML file path or https URL")
+    p_add.add_argument(
+        "--type",
+        "-t",
+        choices=["full", "simple"],
+        default="full",
+        help="Capture mode (default: full)",
+    )
+    p_add.add_argument("--jobs", type=int, default=8)
+    p_add.set_defaults(func=cmd_add)
+
     p_open = sub.add_parser("open", parents=[shared], help="Export a revision and open in the browser")
     p_open.add_argument("revision")
     p_open.add_argument("--no-launch", action="store_true")
@@ -1596,8 +1844,9 @@ def main(argv=None):
     parser = build_parser()
 
     known = {
-        "pull", "new", "feeds", "list", "search", "revisions", "show", "export",
-        "tag", "freeze", "unfreeze", "retention", "gc", "delete", "open", "serve", "tui",
+        "pull", "update", "add", "new", "feeds", "list", "search", "revisions", "show",
+        "export", "tag", "freeze", "unfreeze", "retention", "gc", "delete", "delete-feed",
+        "open", "serve", "tui",
     }
 
     if not argv or argv[0] in ("-h", "--help"):

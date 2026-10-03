@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 
-def run_tui(store):
+def run_tui(store, add_source=None, update_all=None):
     try:
         from textual.app import App, ComposeResult
         from textual.binding import Binding
@@ -30,7 +30,7 @@ def run_tui(store):
     class RssSaverApp(App):
         CSS = """
         Screen { layout: vertical; }
-        #sidebar { width: 28; border: solid $primary; }
+        #sidebar { width: 36; border: solid $primary; }
         #main { width: 1fr; border: solid $accent; }
         #status { height: 3; dock: bottom; }
         DataTable { height: 1fr; }
@@ -39,15 +39,19 @@ def run_tui(store):
             Binding("q", "quit", "Quit"),
             Binding("n", "show_new", "New"),
             Binding("f", "show_feeds", "Feeds"),
+            Binding("u", "pull_update", "Update"),
             Binding("r", "refresh", "Refresh"),
             Binding("z", "freeze", "Freeze"),
             Binding("o", "open_item", "Open"),
+            Binding("d", "delete_feed", "Del feed"),
             Binding("/", "focus_search", "Search"),
         ]
 
-        def __init__(self, store):
+        def __init__(self, store, add_source=None, update_all=None):
             super().__init__()
             self.store = store
+            self.add_source = add_source
+            self.update_all = update_all
             self.mode = "new"
             self._rows = []
 
@@ -58,10 +62,22 @@ def run_tui(store):
                     yield Label("rss-saver TUI")
                     yield Button("New (8h)", id="btn_new")
                     yield Button("Feeds", id="btn_feeds")
+                    yield Button("Pull update", id="btn_update")
                     yield Button("Search", id="btn_search")
                     yield Input(placeholder="FTS query…", id="search")
-                    yield Input(placeholder="Retention days for selected feed", id="retention")
+                    yield Label("Add feed / OPML")
+                    yield Input(
+                        placeholder="RSS URL or OPML path/https…",
+                        id="add_source",
+                    )
+                    yield Button("Add RSS", id="btn_add_rss")
+                    yield Button("Add OPML", id="btn_add_opml")
+                    yield Input(
+                        placeholder="Retention days for selected feed",
+                        id="retention",
+                    )
                     yield Button("Set retention", id="btn_retention")
+                    yield Button("Delete feed", id="btn_delete_feed")
                 with Vertical(id="main"):
                     yield Static("What's new (8h)", id="title")
                     yield DataTable(id="table")
@@ -79,6 +95,8 @@ def run_tui(store):
                 self.action_show_new()
             elif event.button.id == "btn_feeds":
                 self.action_show_feeds()
+            elif event.button.id == "btn_update":
+                self.action_pull_update()
             elif event.button.id == "btn_search":
                 self.action_focus_search()
                 q = self.query_one("#search", Input).value.strip()
@@ -86,12 +104,20 @@ def run_tui(store):
                     self._load_search(q)
             elif event.button.id == "btn_retention":
                 self._set_retention()
+            elif event.button.id == "btn_add_rss":
+                self._add_source(kind="rss")
+            elif event.button.id == "btn_add_opml":
+                self._add_source(kind="opml")
+            elif event.button.id == "btn_delete_feed":
+                self.action_delete_feed()
 
         def on_input_submitted(self, event: Input.Submitted):
             if event.input.id == "search":
                 q = event.value.strip()
                 if q:
                     self._load_search(q)
+            elif event.input.id == "add_source":
+                self._add_source(kind="auto")
 
         def _clear_table(self, columns):
             table = self.query_one("#table", DataTable)
@@ -110,9 +136,8 @@ def run_tui(store):
                 ["published", "feed", "title", "rev", "item", "frozen"]
             )
             for r in rows:
-                when = r.get("published_at") or r.get("downloaded_at") or ""
                 table.add_row(
-                    when[:19],
+                    (r.get("published_at") or "")[:19],
                     (r.get("feed_title") or "")[:24],
                     (r.get("title") or "")[:48],
                     str(r.get("rev")),
@@ -129,22 +154,36 @@ def run_tui(store):
             self.query_one("#title", Static).update("Feeds")
             feeds = [dict(f) for f in self.store.list_feeds()]
             self._rows = feeds
-            table = self._clear_table(
-                ["title", "items", "retention", "last_fetched", "uuid"]
-            )
+            table = self._clear_table(["title", "items", "retention", "uuid"])
             for f in feeds:
                 ret = f.get("retention_days")
                 table.add_row(
                     (f.get("title") or f.get("url") or "")[:40],
                     str(f.get("item_count") or 0),
                     "∞" if ret is None else str(ret),
-                    (f.get("last_fetched_at") or "")[:19],
                     (f.get("uuid") or "")[:8],
                     key=f.get("uuid"),
                 )
             self.query_one("#status", Static).update(
                 f"{len(feeds)} feed(s) | DB: {self.store.path}"
             )
+
+        def action_pull_update(self):
+            if self.update_all is None:
+                self.query_one("#status", Static).update(
+                    "Update not available in this TUI session"
+                )
+                return
+            n = len(self.store.list_feeds())
+            self.query_one("#status", Static).update(
+                f"Delta-updating {n} stored feed(s)…"
+            )
+            try:
+                msg = self.update_all(mode="full", jobs=8)
+                self.query_one("#status", Static).update(msg)
+                self.action_show_new()
+            except Exception as exc:
+                self.query_one("#status", Static).update(f"Update failed: {exc}")
 
         def _load_search(self, query):
             self.mode = "search"
@@ -182,10 +221,52 @@ def run_tui(store):
             if table.row_count == 0:
                 return None
             try:
-                return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+                return table.coordinate_to_cell_key(
+                    table.cursor_coordinate
+                ).row_key.value
             except Exception:
-                row = table.get_row_at(table.cursor_row)
                 return None
+
+        def _add_source(self, kind="auto"):
+            if self.add_source is None:
+                self.query_one("#status", Static).update(
+                    "Add not available in this TUI session"
+                )
+                return
+            source = self.query_one("#add_source", Input).value.strip()
+            if not source:
+                self.query_one("#status", Static).update(
+                    "Enter an RSS URL or OPML path/https URL"
+                )
+                return
+            self.query_one("#status", Static).update(f"Adding {source}…")
+            try:
+                msg = self.add_source(source, kind=kind)
+                self.query_one("#add_source", Input).value = ""
+                self.query_one("#status", Static).update(msg)
+                self.action_show_feeds()
+            except Exception as exc:
+                self.query_one("#status", Static).update(f"Add failed: {exc}")
+
+        def action_delete_feed(self):
+            if self.mode != "feeds":
+                self.query_one("#status", Static).update(
+                    "Switch to Feeds (f), select a feed, then Delete"
+                )
+                return
+            key = self._selected_key()
+            if not key:
+                self.query_one("#status", Static).update("Select a feed to delete")
+                return
+            try:
+                result = self.store.delete_feed(key, force=True)
+                self.query_one("#status", Static).update(
+                    f"Deleted feed {result['title'] or result['url']} "
+                    f"({result['items_deleted']} items)"
+                )
+                self.action_show_feeds()
+            except Exception as exc:
+                self.query_one("#status", Static).update(str(exc))
 
         def action_freeze(self):
             key = self._selected_key()
@@ -193,13 +274,15 @@ def run_tui(store):
                 self.query_one("#status", Static).update("Nothing selected")
                 return
             if self.mode == "feeds":
-                self.query_one("#status", Static).update("Select an item row to freeze")
+                self.query_one("#status", Static).update(
+                    "Select an item row to freeze"
+                )
                 return
-            # key is revision uuid — resolve item
             rev = self.store.get_revision(key)
             if not rev:
-                # maybe item uuid prefix match from display
-                self.query_one("#status", Static).update("Could not resolve selection")
+                self.query_one("#status", Static).update(
+                    "Could not resolve selection"
+                )
                 return
             item = self.store.conn.execute(
                 "SELECT uuid FROM items WHERE id = ?", (rev["item_id"],)
@@ -209,7 +292,6 @@ def run_tui(store):
             self.action_refresh()
 
         def action_open_item(self):
-            import os
             import subprocess
             import sys
             import tempfile
@@ -245,8 +327,9 @@ def run_tui(store):
                 days = int(raw)
             feed = self.store.set_retention(key, days)
             self.query_one("#status", Static).update(
-                f"Retention for {feed['title'] or feed['url']}: {feed['retention_days']}"
+                f"Retention for {feed['title'] or feed['url']}: "
+                f"{feed['retention_days']}"
             )
             self.action_show_feeds()
 
-    RssSaverApp(store).run()
+    RssSaverApp(store, add_source=add_source, update_all=update_all).run()

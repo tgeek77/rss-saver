@@ -59,6 +59,10 @@ Override with `--db /path/to/file.db` on any command.
 # Large OPML, parallel workers (cron-friendly)
 ./rss-saver.py pull -p ~/intel.opml -t full --jobs 8
 
+# Update every feed already in the database (delta only)
+./rss-saver.py update -t full --jobs 8
+./rss-saver.py pull --all -t full --jobs 8
+
 # Also write HTML/PNG/INDEX.md under ~/feeds
 ./rss-saver.py pull -u https://example.com/feed.xml -t full --dl -o ~/feeds
 
@@ -84,6 +88,10 @@ Override with `--db /path/to/file.db` on any command.
 
 ## Review and query
 
+All time windows (`--since`, `--until`, `new`, `feeds --updated-since`, retention GC) use **article publish time**. Pull/download time is stored only as metadata.
+
+If a feed entry has no publish date, `published_at` stays empty. Those items are **excluded** from `new --since` / TUI New (pull time is metadata only and is never shown as publish time).
+
 ```bash
 ./rss-saver.py new --since 8h
 ./rss-saver.py new --since 8h --json          # agent-friendly
@@ -97,9 +105,26 @@ Override with `--db /path/to/file.db` on any command.
 ./rss-saver.py export REVISION_UUID -o /tmp/out
 ```
 
+## Add and remove feeds
+
+```bash
+# Single RSS/Atom feed (also pulls)
+./rss-saver.py add -u https://example.com/feed.xml -t full
+
+# OPML from a local file or https URL
+./rss-saver.py add -p ~/intel.opml -t full
+./rss-saver.py add -p https://example.com/feeds.opml -t full
+
+# Delete a feed and all of its articles (use --force if any are frozen)
+./rss-saver.py delete-feed FEED_UUID_OR_URL
+./rss-saver.py delete-feed FEED_UUID_OR_URL --force
+```
+
+In the TUI (`./rss-saver.py tui`): **Pull update** (or `u`) delta-refreshes all stored feeds. Paste an RSS URL or OPML path/https URL, then **Add RSS** / **Add OPML**. On the Feeds screen, select a feed and **Delete feed** (or press `d`).
+
 ## Freeze, retention, GC
 
-Default retention is **unlimited**. Set a per-feed age limit (days); frozen items are never deleted by GC.
+Default retention is **unlimited**. Set a per-feed age limit (days) measured from **publish time**; frozen items are never deleted by GC.
 
 ```bash
 ./rss-saver.py retention set --feed FEED_UUID_OR_URL 30   # 1 month
@@ -134,7 +159,7 @@ Browse what’s new, feeds, search, freeze, set retention, open HTML/PNG.
 ## Cron example
 
 ```bash
-0 * * * * /path/to/rss-saver.py pull -p /home/you/intel.opml -t full --jobs 8 --db /home/you/.local/share/rss-saver/intel.db
+0 * * * * /path/to/rss-saver.py update -t full --jobs 8 --db /home/you/.local/share/rss-saver/intel.db
 0 8 * * * /path/to/rss-saver.py gc --db /home/you/.local/share/rss-saver/intel.db
 ```
 
